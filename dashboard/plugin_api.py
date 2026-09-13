@@ -110,6 +110,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "ticker_enabled": True,
     "ticker_speed": "normal",           # slow | normal | fast
     "ticker_font_size": 11,             # px, 9-20 — readability knob (Tony)
+    "ticker_grouping": "newest",        # newest | source | unread_first
     "pause_on_hover": True,
     "show_source": True,
     "relative_time": True,
@@ -1291,6 +1292,10 @@ def _validate_setting(key: str, value: Any) -> Any:
     if key in {"ticker_enabled", "pause_on_hover", "show_source", "relative_time", "only_unread"}:
         if not isinstance(value, bool):
             raise _err(400, "bad_type", f"{key} must be a boolean")
+        return value
+    if key == "ticker_grouping":
+        if value not in {"newest", "source", "unread_first"}:
+            raise _err(400, "bad_grouping", "ticker_grouping must be one of newest|source|unread_first")
         return value
     if key == "open_article_behavior":
         if value not in {"internal", "external"}:

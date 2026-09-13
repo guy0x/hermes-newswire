@@ -144,6 +144,9 @@ function ensureStyles() {
     `.${ID}-src { color: var(--ui-text-quaternary); }`,
     `.${ID}-dot { color: var(--ui-accent); flex: none; }`,
     `.${ID}-favicon { flex: none; width: 14px; height: 14px; border-radius: 3px; object-fit: contain; background: none; }`,
+    `.${ID}-section { display: flex; align-items: center; gap: 0.5rem; padding: 0.625rem 1rem 0.25rem; font-size: 0.75rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ui-text-secondary); position: sticky; top: 0; background: var(--ui-bg-editor); border-bottom: 1px solid var(--ui-stroke-tertiary); }`,
+    `.${ID}-sectioncount { color: var(--ui-text-quaternary); font-weight: 400; }`,
+    `.${ID}-divider { flex: none; padding: 0 0.75rem 0 0.25rem; font-size: 0.625rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ui-accent); white-space: nowrap; }`,
     `.${ID}-page .${ID}-favicon { width: 16px; height: 16px; }`,
     `.${ID}-age { color: var(--ui-text-quaternary); flex: none; }`,
     `.${ID}-marquee { animation: ${ID}-scroll var(--nw-duration, 55s) linear infinite; }`,
@@ -360,8 +363,47 @@ function TickerHalf({ articles, settings }) {
   return jsx('div', {
     className: `${ID}-half`,
     'aria-hidden': 'true',
-    children: articles.map(a => jsx(TickerItem, { a, settings }, `h${a.id}`))
+    children: articles.map((a, i) => a.__divider
+      ? jsx('span', { className: `${ID}-divider`, key: `d${i}`, children: `${a.source_name} —` })
+      : jsx(TickerItem, { a, settings }, `h${a.id}`))
   })
+}
+
+// Ticker grouping: how the strip orders its stories.
+//  newest      — global chronological mix (the classic wire)
+//  source      — one block per source, most-recently-updated source first,
+//                newest within each block; a ' • ' divider between blocks
+//  unread_first— catch-up mode: unread stories lead (newest first), then the
+//                rest chronologically
+function groupTickerArticles(articles, mode) {
+  if (!Array.isArray(articles) || articles.length === 0) return []
+  if (mode === 'source') {
+    const bySrc = new Map()
+    for (const a of articles) {
+      const k = a.source_id ?? a.source_name
+      if (!bySrc.has(k)) bySrc.set(k, { name: a.source_name, list: [] })
+      bySrc.get(k).list.push(a)
+    }
+    const blocks = [...bySrc.values()].map(b => {
+      b.list.sort((x, y) => Date.parse(y.published_at || y.discovered_at || 0) - Date.parse(x.published_at || x.discovered_at || 0))
+      b.newest = Date.parse(b.list[0].published_at || b.list[0].discovered_at || 0)
+      return b
+    })
+    blocks.sort((x, y) => y.newest - x.newest)
+    const out = []
+    blocks.forEach((b, i) => {
+      if (i > 0) out.push({ __divider: true, source_name: b.name })
+      out.push(...b.list)
+    })
+    return out
+  }
+  if (mode === 'unread_first') {
+    const byTime = (x, y) => Date.parse(y.published_at || y.discovered_at || 0) - Date.parse(x.published_at || x.discovered_at || 0)
+    const unread = articles.filter(a => !a.read).sort(byTime)
+    const read = articles.filter(a => a.read).sort(byTime)
+    return [...unread, ...read]
+  }
+  return articles // newest: backend already orders chronologically
 }
 
 // Tiny ticker-end control: force-fetch all feeds now. Module-level busy flag
@@ -416,7 +458,11 @@ function NewswireTicker() {
   const reduced = useReducedMotion()
   useAgeTick()
   const fontSizePx = Math.min(20, Math.max(9, Number(settings?.ticker_font_size) || 11))
-  const articles = useMemo(() => (paused ? [] : articlesQ.data || []), [settings, articlesQ.data, paused])
+  const grouping = settings?.ticker_grouping || 'newest'
+  const articles = useMemo(
+    () => groupTickerArticles(paused ? [] : (articlesQ.data || []), grouping),
+    [settings, articlesQ.data, paused, grouping]
+  )
   openArticleMode = settings?.open_article_behavior === 'external' ? 'external' : 'internal'
 
   // Pane height tracks the font setting from ANY settings refresh (poll,
@@ -587,13 +633,39 @@ function LatestTab({ sources, prefs, setPrefs }) {
   })
 
   const fetched = Array.isArray(arts.data?.items) ? arts.data.items : []
+  const [grouping, setGrouping] = useState(() => storageGet?.('latest.grouping', 'newest') || 'newest')
+  useEffect(() => { storageSet?.('latest.grouping', grouping) }, [grouping])
   const needle = debouncedQ.trim().toLowerCase()
-  const list = needle
+  const filtered = needle
     ? fetched.filter(a =>
         (a.title || '').toLowerCase().includes(needle) ||
         (a.summary || '').toLowerCase().includes(needle) ||
         (a.source_name || '').toLowerCase().includes(needle))
     : fetched
+  // Page grouping: section headers between source blocks on the page (unlike
+  // the ticker's inline divider, there's room for a real header row here).
+  const sections = useMemo(() => {
+    if (grouping === 'source') {
+      const bySrc = new Map()
+      for (const a of filtered) {
+        const k = a.source_id ?? a.source_name
+        if (!bySrc.has(k)) bySrc.set(k, { name: a.source_name, favicon: a.favicon_url, list: [] })
+        bySrc.get(k).list.push(a)
+      }
+      const blocks = [...bySrc.values()].map(b => {
+        b.list.sort((x, y) => Date.parse(y.published_at || y.discovered_at || 0) - Date.parse(x.published_at || x.discovered_at || 0))
+        b.newest = Date.parse(b.list[0].published_at || b.list[0].discovered_at || 0)
+        return b
+      })
+      blocks.sort((x, y) => y.newest - x.newest)
+      return blocks
+    }
+    if (grouping === 'unread_first') {
+      const byTime = (x, y) => Date.parse(y.published_at || y.discovered_at || 0) - Date.parse(x.published_at || x.discovered_at || 0)
+      return [{ name: null, list: [...filtered.filter(a => !a.read).sort(byTime), ...filtered.filter(a => a.read).sort(byTime)] }]
+    }
+    return [{ name: null, list: filtered }]
+  }, [filtered, grouping])
   const total = arts.data?.total ?? 0
 
   // Persist the last filter for next visit (UI pref, ctx.storage).
@@ -622,6 +694,15 @@ function LatestTab({ sources, prefs, setPrefs }) {
         jsx(Switch, { size: 'xs', checked: unreadOnly, onCheckedChange: v => { setUnreadOnly(v); setOffset(0) } }),
         'Unread only'
       ]}),
+      jsx(SegmentedControl, {
+        value: grouping,
+        onChange: setGrouping,
+        options: [
+          { id: 'newest', label: 'Newest' },
+          { id: 'source', label: 'By source' },
+          { id: 'unread_first', label: 'Unread first' }
+        ]
+      }),
       jsx('span', { style: { flex: 1 } }),
       jsx(Button, {
         size: 'xs', variant: 'ghost',
@@ -638,9 +719,16 @@ function LatestTab({ sources, prefs, setPrefs }) {
           ? jsx('div', { className: 'grid h-full place-items-center p-4', children: jsx(GlyphSpinner, {}) })
           : arts.isError
             ? jsx('div', { className: 'grid h-full place-items-center p-4', children: jsx(ErrorState, { title: 'Could not load articles', description: errText(arts.error) }) })
-            : list.length === 0
+            : sections.every(s => s.list.length === 0)
               ? jsx('div', { className: 'grid h-full place-items-center p-4', children: jsx(EmptyState, { title: needle ? 'No matching headlines' : 'No articles yet', description: needle ? 'Try a different search.' : 'Add a source and refresh.' }) })
-              : jsx('div', { className: `${ID}-list`, children: list.map(a => jsx(ArticleRow, { a, key: a.id })) })
+              : jsx('div', { className: `${ID}-list`, children: sections.map((sec, si) => jsxs('div', { 'data-section': si, children: [
+                  sec.name ? jsxs('div', { className: `${ID}-section`, children: [
+                    sec.favicon ? jsx('img', { src: sec.favicon, className: `${ID}-favicon`, alt: '' }) : null,
+                    jsx('span', { children: sec.name }),
+                    jsx('span', { className: `${ID}-sectioncount`, children: `${sec.list.length}` })
+                  ] }) : null,
+                  ...sec.list.map(a => jsx(ArticleRow, { a, key: a.id }))
+                ] }, `sec${si}`)) })
       })
     }),
     jsxs('div', { className: `${ID}-pager`, children: [
@@ -963,6 +1051,18 @@ function SettingsTab() {
               value: s.ticker_speed || 'normal',
               onChange: v => save.mutate({ ticker_speed: v }),
               options: SPEED_OPTIONS
+            })
+          ]}),
+          jsxs('div', { className: `${ID}-setrow`, children: [
+            jsx('span', { className: `${ID}-setlabel`, children: 'Group headlines' }),
+            jsx(SegmentedControl, {
+              value: s.ticker_grouping || 'newest',
+              onChange: v => save.mutate({ ticker_grouping: v }),
+              options: [
+                { id: 'newest', label: 'Newest' },
+                { id: 'source', label: 'By source' },
+                { id: 'unread_first', label: 'Unread first' }
+              ]
             })
           ]}),
           jsxs('div', { className: `${ID}-setrow`, children: [
