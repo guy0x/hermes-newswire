@@ -1,5 +1,13 @@
 # Hermes Newswire
 
+[![](https://img.shields.io/badge/follow-tonysimons_-1DA1F2?style=for-the-badge&logo=x&logoColor=white)](https://x.com/tonysimons_)
+[![X Money](https://img.shields.io/badge/X_Money-%40tonysimons_-black?style=for-the-badge&logo=x&logoColor=white)](https://x.com/tonysimons_)
+[![](https://img.shields.io/badge/tonysimons.dev-111827?style=for-the-badge&logo=googlechrome&logoColor=white)](https://tonysimons.dev)
+[![License: MIT](https://img.shields.io/badge/license-MIT-6c63ff?style=for-the-badge)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-102%20passed-brightgreen?style=for-the-badge)](#test--verify)
+[![Zero API keys](https://img.shields.io/badge/zero-API%20keys-00d26a?style=for-the-badge)](#security)
+[![No LLM tokens](https://img.shields.io/badge/routine%20ops-no%20model%20tokens-00d26a?style=for-the-badge)](#security)
+
 A breaking-news ticker plugin for [Hermes Desktop](https://hermes-agent.nousresearch.com) — a thin, continuously scrolling newswire strip docked just above the statusbar, backed by a model-free RSS/Atom/JSON-Feed engine.
 
 ```
