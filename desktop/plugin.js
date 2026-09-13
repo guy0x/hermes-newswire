@@ -76,7 +76,7 @@ let addFocusArmed = false
 // Constants
 // ─────────────────────────────────────────────────────────────────────────
 
-const SPEED_DURATIONS = { slow: 90, normal: 55, fast: 30 } // seconds per loop
+const SPEED_DURATIONS = { slow: 240, normal: 150, fast: 80 } // seconds per loop (slowed ~2.5x on Tony's read-feedback)
 const ROTATE_MS = 8000 // reduced-motion: static headline rotation
 const TICKER_POLL_MS = 30_000
 const PAGE_POLL_MS = 60_000
@@ -343,7 +343,7 @@ function NewswireTicker() {
   const [settingsQ, settings] = useSettings()
   const paused = useValue($tickerPaused)
   const enabled = settings ? settings.ticker_enabled !== false : false
-  const duration = SPEED_DURATIONS[settings?.ticker_speed] || 55
+  const duration = SPEED_DURATIONS[settings?.ticker_speed] || 150
 
   const articlesQ = useQuery({
     queryKey: [ID, 'ticker', settings?.only_unread === true],
