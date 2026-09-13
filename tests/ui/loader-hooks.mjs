@@ -1,7 +1,7 @@
 const STUB_URLS = {
-  "@hermes/plugin-sdk": "file:///home/tony/.hermes/plugins/hermes-newswire/tests/ui/.stubs/sdk.mjs",
-  "react": "file:///home/tony/.hermes/plugins/hermes-newswire/tests/ui/.stubs/react.mjs",
-  "react/jsx-runtime": "file:///home/tony/.hermes/plugins/hermes-newswire/tests/ui/.stubs/jsx-runtime.mjs"
+  "@hermes/plugin-sdk": "file:///home/tony/projects/hermes-newswire/tests/ui/.stubs/sdk.mjs",
+  "react": "file:///home/tony/projects/hermes-newswire/tests/ui/.stubs/react.mjs",
+  "react/jsx-runtime": "file:///home/tony/projects/hermes-newswire/tests/ui/.stubs/jsx-runtime.mjs"
 }
 export function resolve(specifier, context, nextResolve) {
   if (STUB_URLS[specifier]) {

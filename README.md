@@ -16,7 +16,7 @@ NEWSWIRE ◆ Hacker News: Why is Google still serving dodgy ads? · 56m ◆ The 
 ## Install (unified plugin)
 
 ```bash
-git clone <this-repo> ~/.hermes/plugins/hermes-newswire/
+git clone https://github.com/tony-simons-aiowa/hermes-newswire ~/.hermes/plugins/hermes-newswire/
 # enable the backend (plugins.enabled must be a real YAML list):
 #   edit ~/.hermes/config.yaml → plugins: enabled: [- hermes-newswire]
 # restart the desktop's serve child (or restart Hermes Desktop) so the
