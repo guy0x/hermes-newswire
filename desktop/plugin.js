@@ -146,7 +146,7 @@ function ensureStyles() {
     `.${ID}-favicon { flex: none; width: 14px; height: 14px; border-radius: 3px; object-fit: contain; background: none; }`,
     `.${ID}-section { display: flex; align-items: center; gap: 0.5rem; padding: 0.625rem 1rem 0.25rem; font-size: 0.75rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ui-text-secondary); position: sticky; top: 0; background: var(--ui-bg-editor); border-bottom: 1px solid var(--ui-stroke-tertiary); }`,
     `.${ID}-sectioncount { color: var(--ui-text-quaternary); font-weight: 400; }`,
-    `.${ID}-srcselect { background: var(--ui-bg-input); color: var(--ui-text-primary); }`,
+    `.${ID}-srcselect { background: var(--ui-bg-elevated); color: var(--ui-text-primary); }`,
     `.${ID}-srcselect option { background: var(--ui-bg-elevated); color: var(--ui-text-primary); }`,
     `.${ID}-divider { flex: none; padding: 0 0.75rem 0 0.25rem; font-size: 0.625rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ui-accent); white-space: nowrap; }`,
     `.${ID}-page .${ID}-favicon { width: 16px; height: 16px; }`,
