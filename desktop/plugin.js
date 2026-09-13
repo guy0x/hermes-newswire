@@ -146,6 +146,8 @@ function ensureStyles() {
     `.${ID}-favicon { flex: none; width: 14px; height: 14px; border-radius: 3px; object-fit: contain; background: none; }`,
     `.${ID}-section { display: flex; align-items: center; gap: 0.5rem; padding: 0.625rem 1rem 0.25rem; font-size: 0.75rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ui-text-secondary); position: sticky; top: 0; background: var(--ui-bg-editor); border-bottom: 1px solid var(--ui-stroke-tertiary); }`,
     `.${ID}-sectioncount { color: var(--ui-text-quaternary); font-weight: 400; }`,
+    `.${ID}-srcselect { background: var(--ui-bg-input); color: var(--ui-text-primary); }`,
+    `.${ID}-srcselect option { background: var(--ui-bg-elevated); color: var(--ui-text-primary); }`,
     `.${ID}-divider { flex: none; padding: 0 0.75rem 0 0.25rem; font-size: 0.625rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ui-accent); white-space: nowrap; }`,
     `.${ID}-page .${ID}-favicon { width: 16px; height: 16px; }`,
     `.${ID}-age { color: var(--ui-text-quaternary); flex: none; }`,
@@ -685,7 +687,7 @@ function LatestTab({ sources, prefs, setPrefs }) {
         value: sourceId,
         onChange: e => { setSourceId(e.target.value); setOffset(0) },
         'aria-label': 'Filter articles by source',
-        className: 'rounded-md border border-(--ui-stroke-secondary) bg-transparent px-2 py-1 text-xs text-(--ui-text-secondary)',
+        className: `${ID}-srcselect rounded-md border border-(--ui-stroke-secondary) px-2 py-1 text-xs`,
         children: [jsx('option', { value: 'all', children: 'All sources' })].concat(
           sources.map(s => jsx('option', { value: String(s.id), children: s.name }, s.id))
         )
@@ -1294,3 +1296,5 @@ export default {
     return dispose
   }
 }
+
+// v-shade: contrast fix marker
