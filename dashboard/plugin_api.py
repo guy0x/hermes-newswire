@@ -1430,3 +1430,124 @@ async def discover(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             entry["is_feed"] = False
         results.append(entry)
     return {"url": url, "candidates": results}
+
+
+# ---------------------------------------------------------------------------
+# Feed search (Feedly public index — no API key; fallback to discovery)
+# ---------------------------------------------------------------------------
+FEEDLY_SEARCH = "https://cloud.feedly.com/v3/search/feeds"
+MAX_SEARCH_RESULTS = 12
+
+
+@router.post("/search")
+async def search_feeds(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Search feeds by topic or site name.
+
+    Primary: Feedly's public feed search (no key). Fallback: treat the query
+    as a bare hostname (e.g. "arstechnica.com") and run classic discovery on
+    https://<query>/. Every candidate feed URL is re-validated through the
+    SSRF gate before being returned.
+    """
+    q = str(payload.get("query") or payload.get("q") or "").strip()
+    if not q:
+        raise _err(400, "missing_query", "body must include 'query'")
+
+    results: list[dict[str, Any]] = []
+
+    # A URL-ish query skips the index and goes straight to discovery.
+    if "://" in q or q.startswith("www.") or "." in q.split()[0] and " " not in q:
+        try:
+            url = q if "://" in q else f"https://{q}"
+            await _assert_public_http_url_sync(url)
+            disc = await _discover_url(url)
+            return {"query": q, "results": disc, "via": "discovery"}
+        except UnsafeURL as exc:
+            raise _err(400, "unsafe_url", str(exc)) from exc
+
+    # Topic search via Feedly's public index.
+    try:
+        outcome = await _http_fetch(
+            f"{FEEDLY_SEARCH}?{urlencode({'query': q, 'count': MAX_SEARCH_RESULTS, 'locale': 'en'})}"
+        )
+        if outcome.status == 200:
+            doc = json.loads(outcome.body.decode("utf-8", "replace"))
+            for r in doc.get("results", [])[:MAX_SEARCH_RESULTS]:
+                feed_id = str(r.get("feedId") or "")
+                if not feed_id.startswith("feed/"):
+                    continue
+                feed_url = feed_id[len("feed/"):]
+                # Same trust boundary as every other URL we hand the client.
+                try:
+                    await _assert_public_http_url_sync(feed_url)
+                except UnsafeURL:
+                    continue
+                results.append({
+                    "title": strip_html(r.get("title")) or feed_url,
+                    "feed_url": feed_url,
+                    "website": (r.get("website") or "")[:300],
+                    "description": strip_html(r.get("description") or "")[:300],
+                    "subscribers": r.get("subscribers") or 0,
+                    "language": r.get("language") or "",
+                    "icon_url": ((r.get("iconUrl") or "") if await _is_safe_image_url(r.get("iconUrl")) else ""),
+                })
+    except Exception:
+        pass  # index unreachable → fall through to discovery fallback
+
+    if results:
+        return {"query": q, "results": results, "via": "feedly"}
+
+    # Fallback: query as bare hostname (e.g. "nasa.gov").
+    if "." in q and " " not in q:
+        try:
+            url = f"https://{q}"
+            await _assert_public_http_url_sync(url)
+            disc = await _discover_url(q if "://" in q else url)
+            return {"query": q, "results": disc, "via": "discovery"}
+        except UnsafeURL as exc:
+            raise _err(400, "unsafe_url", str(exc)) from exc
+
+    return {"query": q, "results": [], "via": "none"}
+
+
+async def _is_safe_image_url(u: str | None) -> bool:
+    if not u:
+        return False
+    try:
+        await _assert_public_http_url_sync(u)
+        return True
+    except UnsafeURL:
+        return False
+
+
+async def _discover_url(url: str) -> list[dict[str, Any]]:
+    """Shared discovery core for /discover and /search (hostname form)."""
+    try:
+        outcome = await _http_fetch(url)
+    except Exception as exc:
+        raise _err(502, "fetch_failed", f"could not fetch {url}: {exc}") from exc
+    if outcome.status != 200:
+        raise _err(502, "fetch_failed", f"HTTP {outcome.status} fetching {url}")
+    candidates = discover_in_html(url, outcome.body)
+    results: list[dict[str, Any]] = []
+    for cand in candidates[:MAX_DISCOVERY_PROBES]:
+        entry: dict[str, Any] = {"url": cand, "feed_url": cand}
+        try:
+            outcome = await _http_fetch(cand)
+        except Exception as exc:
+            entry["is_feed"] = False
+            entry["error"] = str(exc)[:300]
+            results.append(entry)
+            continue
+        ctype = outcome.headers.get("content-type", "")
+        if outcome.status == 200 and looks_like_feed(outcome.body, ctype):
+            entry["is_feed"] = True
+            try:
+                feed = parse_feed(outcome.body, ctype)
+                entry["title"] = feed.get("title")
+                entry["format"] = feed.get("format")
+            except (ET.ParseError, ValueError, json.JSONDecodeError):
+                entry["title"] = None
+        else:
+            entry["is_feed"] = False
+        results.append(entry)
+    return results

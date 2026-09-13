@@ -594,14 +594,19 @@ function AddSourceCard({ onAdded, autofocus }) {
     }
   }, [autofocus])
 
-  const discover = async () => {
+  // One input, two paths, routed by the SERVER (/search dual-routes:
+  // URL-ish query -> classic discovery; topic -> Feedly's public index).
+  const looksLikeUrl = /^https?:\/\//i.test(url.trim()) || /^[\w.-]+\.[a-z]{2,}(\/|$|:)/i.test(url.trim())
+  const search = async () => {
     setError(''); setCandidates(null); setBusy(true)
     try {
-      const out = await rest('/discover', { method: 'POST', body: { url: url.trim() } })
-      const cands = (out.candidates || []).filter(c => c.is_feed)
+      const out = await rest('/search', { method: 'POST', body: { query: url.trim() } })
+      let cands = out.results || []
+      if (out.via === 'discovery') cands = cands.filter(c => c.is_feed)
+      if (out.via === 'feedly') cands = cands.filter(c => c.feed_url)
       setCandidates(cands)
       setPicked(0)
-      if (!cands.length) setError('No feed found at that URL.')
+      if (!cands.length) setError(looksLikeUrl ? 'No feed found at that URL.' : `No feeds found for “${url.trim()}”.`)
     } catch (e) {
       setError(errText(e))
     } finally { setBusy(false) }
@@ -610,7 +615,7 @@ function AddSourceCard({ onAdded, autofocus }) {
   const add = async (feedUrl) => {
     setBusy(true); setError('')
     try {
-      await rest('/sources', { method: 'POST', body: { url: url.trim(), feed_url: feedUrl } })
+      await rest('/sources', { method: 'POST', body: { url: looksLikeUrl ? url.trim() : '', feed_url: feedUrl } })
       setUrl(''); setCandidates(null)
       onAdded()
     } catch (e) {
@@ -619,34 +624,38 @@ function AddSourceCard({ onAdded, autofocus }) {
   }
 
   return jsxs('div', { className: `${ID}-card`, children: [
-    jsx('div', { className: `${ID}-setlabel`, style: { fontSize: '0.8125rem', color: 'var(--ui-text-primary)', fontWeight: 600 }, children: 'Add a source' }),
+    jsx('div', { className: `${ID}-setlabel`, style: { fontSize: '0.8125rem', color: 'var(--ui-text-primary)', fontWeight: 600 }, children: 'Add a source — search by topic or paste a URL' }),
     jsxs('div', { style: { display: 'flex', gap: '0.5rem' }, children: [
       jsx(Input, {
         value: url,
         ref: inputRef,
         onChange: e => setUrl(typeof e === 'string' ? e : e?.target?.value ?? ''),
-        onKeyDown: e => { if (e.key === 'Enter' && url.trim() && !busy) void discover() },
-        placeholder: 'https://www.theverge.com  or a direct feed URL',
+        onKeyDown: e => { if (e.key === 'Enter' && url.trim() && !busy) void search() },
+        placeholder: 'Search topics (“ai news”) or paste a site / feed URL',
         style: { flex: 1 }
       }),
-      jsx(Button, { size: 'sm', onClick: () => void discover(), disabled: busy || !url.trim(), children: busy ? 'Working…' : 'Find feed' })
+      jsx(Button, { size: 'sm', onClick: () => void search(), disabled: busy || !url.trim(), children: busy ? 'Working…' : (looksLikeUrl ? 'Find feed' : 'Search') })
     ]}),
     error ? jsx('div', { className: `${ID}-err`, children: error }) : null,
     candidates && candidates.length > 0 ? jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: '0.375rem' }, children: [
-      candidates.map((c, i) => jsxs('button', {
-        className: `${ID}-cand`,
-        'data-picked': picked === i ? '1' : '0',
-        onClick: () => setPicked(i),
-        children: [
-          jsx('span', { children: picked === i ? '◉' : '○' }),
-          jsx('span', { children: c.title || c.url }),
-          c.format ? jsx(Badge, { variant: 'outline', children: c.format }) : null,
-          jsx('span', { className: 'text-xs text-(--ui-text-quaternary)', style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: c.url })
-        ]
-      }, c.url)),
+      candidates.map((c, i) => {
+        const feedUrl = c.feed_url || c.url
+        return jsxs('button', {
+          className: `${ID}-cand`,
+          'data-picked': picked === i ? '1' : '0',
+          onClick: () => setPicked(i),
+          children: [
+            jsx('span', { children: picked === i ? '◉' : '○' }),
+            jsx('span', { children: c.title || feedUrl }),
+            c.format ? jsx(Badge, { variant: 'outline', children: c.format }) : null,
+            c.subscribers ? jsx('span', { className: 'text-xs text-(--ui-text-quaternary)', children: `${Intl.NumberFormat().format(c.subscribers)} subs` }) : null,
+            jsx('span', { className: 'text-xs text-(--ui-text-quaternary)', style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: feedUrl })
+          ]
+        }, feedUrl)
+      }),
       jsx('div', { children: jsx(Button, {
         size: 'sm',
-        onClick: () => void add(candidates[picked]?.url),
+        onClick: () => void add(candidates[picked]?.feed_url || candidates[picked]?.url),
         disabled: busy,
         children: `Add “${candidates[picked]?.title || 'feed'}”`
       }) })
