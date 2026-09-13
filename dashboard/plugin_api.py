@@ -113,6 +113,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "pause_on_hover": True,
     "show_source": True,
     "relative_time": True,
+    "open_article_behavior": "internal",   # internal (preview pane) | external (OS browser)
     "only_unread": False,
 }
 _TICKER_SPEEDS = {"slow", "normal", "fast"}
@@ -529,6 +530,8 @@ def _db() -> Iterator[sqlite3.Connection]:
         # stale 304 validator) from "parsed but retention-pruned" (fast-path,
         # no churn loop — O1).
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(sources)").fetchall()}
+        if "favicon_url" not in cols:
+            conn.execute("ALTER TABLE sources ADD COLUMN favicon_url TEXT NOT NULL DEFAULT ''")
         if "articles_ever" not in cols:
             conn.execute(
                 "ALTER TABLE sources ADD COLUMN articles_ever INTEGER NOT NULL DEFAULT 0"
@@ -567,6 +570,36 @@ def set_setting(conn: sqlite3.Connection, key: str, value: Any) -> None:
     )
 
 
+
+def _favicon_for_source(row: sqlite3.Row) -> str:
+    """Best favicon URL for a source: stored Feedly/website icon, else the
+    Google s2 favicon service over the site domain (never the feed host —
+    feedburner et al would show the wrong brand). Empty when nothing derivable."""
+    def col(*names: str) -> str:
+        for n in names:
+            if n in row.keys():
+                v = (row[n] or "").strip()
+                if v:
+                    return v
+        return ""
+    stored = col("favicon_url", "stored_favicon")
+    if stored:
+        return stored
+    for cand in (col("url", "src_url"), col("feed_url", "src_feed_url")):
+        try:
+            host = urlsplit(cand).hostname
+        except ValueError:
+            host = None
+        if host and "." in host:
+            # strip common feed/www prefixes to the site brand domain
+            parts = host.split(".")
+            while len(parts) > 2 and parts[0] in ("feeds", "rss", "feed", "news", "www"):
+                parts = parts[1:]
+            domain = ".".join(parts)
+            return f"https://www.google.com/s2/favicons?domain={domain}&sz=32"
+    return ""
+
+
 def _source_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -584,6 +617,7 @@ def _source_row(row: sqlite3.Row) -> dict[str, Any]:
         "error_count": row["error_count"],
         "etag": row["etag"],
         "last_modified": row["last_modified"],
+        "favicon_url": _favicon_for_source(row),
     }
 
 
@@ -601,6 +635,10 @@ def _article_row(row: sqlite3.Row, *, include_summary: bool = True, source_name:
     }
     if source_name is not None:
         out["source_name"] = source_name
+    try:
+        out["favicon_url"] = row["favicon_url"] or ""
+    except (IndexError, KeyError):
+        out["favicon_url"] = ""
     if include_summary:
         out["summary"] = row["summary"]
     return out
@@ -1062,10 +1100,16 @@ async def add_source(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         dup = conn.execute("SELECT id FROM sources WHERE feed_url=?", (feed_url,)).fetchone()
         if dup:
             raise _err(409, "duplicate", f"source already exists (id {dup['id']}) for {feed_url}")
+        icon_url = str(payload.get("icon_url") or "").strip()
+        if icon_url:
+            try:
+                _assert_public_http_url(icon_url)
+            except UnsafeURL:
+                icon_url = ""  # a bad icon never blocks adding the source
         cur = conn.execute(
-            """INSERT INTO sources (name, url, feed_url, enabled, category, created_at, updated_at, refresh_interval)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (final_name, url if url != feed_url else "", feed_url, int(enabled), category, now, now, refresh_interval),
+            """INSERT INTO sources (name, url, feed_url, enabled, category, created_at, updated_at, refresh_interval, favicon_url)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (final_name, url if url != feed_url else "", feed_url, int(enabled), category, now, now, refresh_interval, icon_url),
         )
         source_id = cur.lastrowid
     added = _insert_articles(source_id, feed_url, feed)
@@ -1189,15 +1233,23 @@ def list_articles(
             vals
         ).fetchone()["c"]
         rows = conn.execute(
-            f"""SELECT a.*, s.name AS source_name FROM articles a
+            f"""SELECT a.*, s.name AS source_name, s.url AS src_url, s.feed_url AS src_feed_url,
+                       s.favicon_url AS stored_favicon
+                FROM articles a
                 JOIN sources s ON s.id = a.source_id
                 {clause}
                 ORDER BY COALESCE(a.published_at, a.discovered_at) DESC, a.id DESC
                 LIMIT ? OFFSET ?""",
             vals + [limit, offset],
         ).fetchall()
+    items = []
+    for r in rows:
+        item = _article_row(r, include_summary=include_summary, source_name=r["source_name"])
+        stored = (r["stored_favicon"] or "").strip() if "stored_favicon" in r.keys() else ""
+        item["favicon_url"] = stored or _favicon_for_source(r)
+        items.append(item)
     return {
-        "items": [_article_row(r, include_summary=include_summary, source_name=r["source_name"]) for r in rows],
+        "items": items,
         "total": total,
         "limit": limit,
         "offset": offset,
@@ -1239,6 +1291,10 @@ def _validate_setting(key: str, value: Any) -> Any:
     if key in {"ticker_enabled", "pause_on_hover", "show_source", "relative_time", "only_unread"}:
         if not isinstance(value, bool):
             raise _err(400, "bad_type", f"{key} must be a boolean")
+        return value
+    if key == "open_article_behavior":
+        if value not in {"internal", "external"}:
+            raise _err(400, "bad_open_behavior", "open_article_behavior must be 'internal' or 'external'")
         return value
     if key == "ticker_speed":
         if value not in _TICKER_SPEEDS:
@@ -1551,3 +1607,33 @@ async def _discover_url(url: str) -> list[dict[str, Any]]:
             entry["is_feed"] = False
         results.append(entry)
     return results
+
+
+# ---------------------------------------------------------------------------
+# Open in Hermes preview pane (internal browser)
+# ---------------------------------------------------------------------------
+@router.post("/preview")
+async def open_in_preview(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Open an article in the desktop's in-app preview pane.
+
+    Emits the same ``preview.open`` gateway event the app's own open_preview
+    tool uses (tools/desktop_ui.py emitter), broadcast to live transports so
+    it works from a REST context with no turn-bound session. The renderer's
+    gate opens the pane for the visible window; never steals focus for
+    background content.
+    """
+    url = str(payload.get("url") or "").strip()
+    label = str(payload.get("label") or "").strip()
+    if not url:
+        raise _err(400, "missing_url", "body must include 'url'")
+    try:
+        _assert_public_http_url(url)
+    except UnsafeURL as exc:
+        raise _err(400, "unsafe_url", str(exc)) from exc
+
+    from tui_gateway.server import _broadcast_global_event
+
+    _broadcast_global_event(
+        "preview.open", {"url": url, "label": label or url}
+    )
+    return {"opened": url}

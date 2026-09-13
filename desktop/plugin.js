@@ -129,6 +129,11 @@ function ensureStyles() {
     `.${ID}-ticker { display: flex; align-items: center; width: 100%; height: 100%; min-width: 0; overflow: hidden; background: var(--ui-bg-sidebar, var(--ui-bg-secondary)); border-top: 1px solid var(--ui-stroke-secondary); }`,
     `.${ID}-brand { display: inline-flex; align-items: center; gap: 0.25rem; flex: none; height: 100%; padding: 0 0.5rem; font-size: 0.625rem; font-weight: 700; letter-spacing: 0.08em; color: var(--ui-accent); cursor: pointer; user-select: none; background: none; border: 0; font-family: inherit; }`,
     `.${ID}-brand:hover { background: var(--chrome-action-hover); }`,
+    `.${ID}-refresh { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 1.25rem; height: 100%; background: none; border: 0; padding: 0; font-size: 0.6875rem; color: var(--ui-text-quaternary); cursor: pointer; }`,
+    `.${ID}-refresh:hover { background: var(--chrome-action-hover); color: var(--ui-text-primary); }`,
+    `.${ID}-refresh:focus-visible { outline: 1px solid var(--ui-accent); outline-offset: -1px; }`,
+    `@keyframes ${ID}-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`,
+    `.${ID}-refresh[data-busy="1"] { animation: ${ID}-spin 1s linear infinite; color: var(--ui-accent); }`,
     `.${ID}-viewport { flex: 1 1 0%; min-width: 0; height: 100%; overflow: hidden; }`,
     `.${ID}-track { display: flex; width: max-content; height: 100%; align-items: center; }`,
     `.${ID}-half { display: inline-flex; align-items: center; white-space: nowrap; }`,
@@ -138,6 +143,8 @@ function ensureStyles() {
     `.${ID}-item[data-read="1"] .${ID}-headline { color: var(--ui-text-quaternary); }`,
     `.${ID}-src { color: var(--ui-text-quaternary); }`,
     `.${ID}-dot { color: var(--ui-accent); flex: none; }`,
+    `.${ID}-favicon { flex: none; width: 14px; height: 14px; border-radius: 3px; object-fit: contain; background: none; }`,
+    `.${ID}-page .${ID}-favicon { width: 16px; height: 16px; }`,
     `.${ID}-age { color: var(--ui-text-quaternary); flex: none; }`,
     `.${ID}-marquee { animation: ${ID}-scroll var(--nw-duration, 55s) linear infinite; }`,
     `.${ID}-ticker:not(.${ID}-no-hover):hover .${ID}-marquee, .${ID}-ticker[data-paused="1"] .${ID}-marquee { animation-play-state: paused; }`,
@@ -219,9 +226,24 @@ function errText(e) {
   return raw.slice(0, 300)
 }
 
+// open_article_behavior: 'internal' (default, Tony's pref) opens in the
+// Hermes preview pane via the plugin backend's SSRF-gated /preview route,
+// which emits the same preview.open gateway event the app's own
+// open_preview tool uses. 'external' keeps the OS browser.
+let openArticleMode = 'internal'
 async function openArticle(url, articleId) {
   if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return
-  try { await openExternalFn(url) } catch { /* result-shaped; ignore */ }
+  if (openArticleMode === 'internal') {
+    try {
+      await rest('/preview', { method: 'POST', body: { url } })
+    } catch {
+      // Preview unavailable (non-desktop gateway / pane closed) — fall back
+      // to the external browser rather than doing nothing.
+      try { await openExternalFn(url) } catch { /* result-shaped; ignore */ }
+    }
+  } else {
+    try { await openExternalFn(url) } catch { /* result-shaped; ignore */ }
+  }
   if (articleId != null) {
     try {
       await rest(`/articles/${articleId}/read`, { method: 'POST', body: { read: true } })
@@ -322,7 +344,10 @@ function TickerItem({ a, settings }) {
     children: jsxs('span', {
       style: { display: 'inline-flex', alignItems: 'center', gap: '0.375rem' },
       children: [
-        jsx('span', { className: `${ID}-dot`, children: '◆' }),
+        a.favicon_url
+          ? jsx('img', { src: a.favicon_url, className: `${ID}-favicon`, alt: '',
+              onError: e => { e.currentTarget.style.display = 'none' } })
+          : jsx('span', { className: `${ID}-dot`, children: '◆' }),
         settings?.show_source !== false ? jsx('span', { className: `${ID}-src`, children: `${a.source_name}:` }) : null,
         jsx('span', { className: `${ID}-headline`, children: a.title }),
         age ? jsx('span', { className: `${ID}-age`, children: `· ${age}` }) : null
@@ -336,6 +361,38 @@ function TickerHalf({ articles, settings }) {
     className: `${ID}-half`,
     'aria-hidden': 'true',
     children: articles.map(a => jsx(TickerItem, { a, settings }, `h${a.id}`))
+  })
+}
+
+// Tiny ticker-end control: force-fetch all feeds now. Module-level busy flag
+// dedupes rapid clicks across the ticker's remounts.
+let __tickerRefreshBusy = false
+function TickerRefresh() {
+  const [busy, setBusy] = useState(false)
+  const [flash, setFlash] = useState(null) // 'ok' | 'err' | null
+  const onClick = async () => {
+    if (__tickerRefreshBusy) return
+    __tickerRefreshBusy = true
+    setBusy(true); setFlash(null)
+    try {
+      await rest('/refresh-all', { method: 'POST', body: {} })
+      await queryClient.invalidateQueries({ queryKey: [ID] })
+      setFlash('ok')
+    } catch {
+      setFlash('err')
+    } finally {
+      __tickerRefreshBusy = false
+      setBusy(false)
+      setTimeout(() => setFlash(null), 2000)
+    }
+  }
+  return jsx('button', {
+    className: `${ID}-refresh`,
+    'data-busy': busy ? '1' : '0',
+    title: busy ? 'Fetching feeds…' : 'Refresh all feeds now',
+    'aria-label': 'Refresh all newswire feeds now',
+    onClick: () => void onClick(),
+    children: busy ? '⟳' : (flash === 'ok' ? '✓' : flash === 'err' ? '!' : '⟳')
   })
 }
 
@@ -360,6 +417,7 @@ function NewswireTicker() {
   useAgeTick()
   const fontSizePx = Math.min(20, Math.max(9, Number(settings?.ticker_font_size) || 11))
   const articles = useMemo(() => (paused ? [] : articlesQ.data || []), [settings, articlesQ.data, paused])
+  openArticleMode = settings?.open_article_behavior === 'external' ? 'external' : 'internal'
 
   // Pane height tracks the font setting from ANY settings refresh (poll,
   // UI save, or another surface). applyTickerSettings is idempotent on
@@ -428,6 +486,7 @@ function NewswireTicker() {
         title: 'Open Newswire',
         children: 'NEWSWIRE'
       }),
+      jsx(TickerRefresh, {}),
       content
     ]
   })
@@ -451,6 +510,8 @@ function ArticleRow({ a }) {
         }),
         a.summary ? jsx('div', { className: `${ID}-rowsum`, children: a.summary }) : null,
         jsxs('div', { className: `${ID}-meta`, children: [
+          a.favicon_url ? jsx('img', { src: a.favicon_url, className: `${ID}-favicon`, alt: '',
+            onError: e => { e.currentTarget.style.display = 'none' } }) : null,
           jsx('span', { children: a.source_name }),
           a.read ? jsx('span', { children: '· read' }) : null,
           jsx('span', { title: absTime(a.published_at), children: relTime(a.published_at) || '—' })
@@ -511,6 +572,15 @@ function LatestTab({ sources, prefs, setPrefs }) {
     retry: 1
   })
 
+  // Force a REAL backend refresh (POST /refresh-all fetches every enabled
+  // feed), then invalidate so both the list and the ticker see new articles
+  // immediately — the user shouldn't wait after adding feeds.
+  const hardRefresh = useMutation({
+    mutationFn: () => rest('/refresh-all', { method: 'POST', body: {} }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: [ID] }),
+    onError: () => queryClient.invalidateQueries({ queryKey: [ID] })
+  })
+
   const markAll = useMutation({
     mutationFn: () => rest('/articles/read-all', { method: 'POST', body: {} }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: [ID] })
@@ -553,7 +623,13 @@ function LatestTab({ sources, prefs, setPrefs }) {
         'Unread only'
       ]}),
       jsx('span', { style: { flex: 1 } }),
-      jsx(Button, { size: 'xs', variant: 'ghost', onClick: () => void arts.refetch(), children: 'Refresh' }),
+      jsx(Button, {
+        size: 'xs', variant: 'ghost',
+        title: 'Fetch all feeds now (don\'t wait for the next scheduled poll)',
+        onClick: () => void hardRefresh.mutate(),
+        disabled: hardRefresh.isPending,
+        children: hardRefresh.isPending ? 'Refreshing feeds…' : 'Refresh now'
+      }),
       jsx(Button, { size: 'xs', variant: 'ghost', onClick: () => markAll.mutate(), disabled: markAll.isPending, children: 'Mark all read' })
     ]}),
     jsx('div', { className: `${ID}-scrollwrap`, children:
@@ -848,6 +924,7 @@ function SourcesTab({ sources, onChanged, autofocusAdd }) {
 
 function SettingsTab() {
   const [settingsQ, s] = useSettings()
+  openArticleMode = s?.open_article_behavior === 'external' ? 'external' : 'internal'
   const save = useMutation({
     mutationFn: patch => rest('/settings', { method: 'PATCH', body: patch }),
     onSuccess: (_data, patch) => {
@@ -894,6 +971,17 @@ function SettingsTab() {
               value: String(s.ticker_font_size || 11),
               onChange: v => save.mutate({ ticker_font_size: Number(v) }),
               options: FONT_OPTIONS
+            })
+          ]}),
+          jsxs('div', { className: `${ID}-setrow`, children: [
+            jsx('span', { className: `${ID}-setlabel`, children: 'Open articles in' }),
+            jsx(SegmentedControl, {
+              value: s.open_article_behavior || 'internal',
+              onChange: v => save.mutate({ open_article_behavior: v }),
+              options: [
+                { id: 'internal', label: 'Hermes browser' },
+                { id: 'external', label: 'External' }
+              ]
             })
           ]}),
           jsx(Toggle, { label: 'Show source name', k: 'show_source' }),
