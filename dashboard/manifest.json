@@ -1,0 +1,8 @@
+{
+  "name": "hermes-newswire",
+  "label": "Hermes Newswire",
+  "description": "Breaking-news ticker for Hermes Desktop: RSS/Atom/JSON Feed sources, persistent bottom statusbar ticker, full newswire page, offline cache. No API keys, no model usage.",
+  "icon": "radio-tower",
+  "version": "0.1.0",
+  "api": "plugin_api.py"
+}
