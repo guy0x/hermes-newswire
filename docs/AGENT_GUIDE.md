@@ -72,16 +72,36 @@ chains, and HTML/script injection. Accordingly:
 - `_assert_public_http_url` (+ `_resolve_host_sync`, `_ip_is_blocked`,
   legacy hex/octal IP forms) — the SSRF gate. Every URL and EVERY redirect
   hop passes it. Never bypass, never "just this once" fetch a raw URL.
+- **Connections are pinned to validated IPs.** `_resolve_validated_ips` is
+  the gate's resolution step and returns the approved address set;
+  `_validate_and_pin` binds that set (per hop) into `_PinnedIPBackend`, the
+  httpcore network backend installed by `_build_async_client`.
+  `connect_tcp` dials *only* addresses from that pin table — hostnames are
+  never re-resolved at connect time — so a DNS answer that changes between
+  validation and connection (DNS rebinding / TOCTOU) has no window to land
+  on localhost, RFC1918, or metadata space. Unpinned hosts fail closed with
+  `ConnectError`. Multi-answer DNS: every member must pass the policy, and
+  connection fallback happens only *within* the validated set. Only the
+  dial address is substituted: TLS SNI and certificate verification use the
+  original hostname (httpcore's `start_tls(server_hostname=<host>)`), and
+  the HTTP `Host` header is untouched.
+- Redirects repeat the whole cycle per hop: resolve → validate the new
+  host's address set → pin → connect. A previous hop's approval is never
+  reused for a different hostname (`MAX_REDIRECTS=3` still applies).
 - `_http_fetch` caps: `MAX_REDIRECTS=3`, `CONNECT_TIMEOUT=5s`,
   `TOTAL_TIMEOUT=15s`, `MAX_BODY_BYTES=5MB` (streaming, aborted mid-body).
+- Favicons: the backend never fetches favicon URLs — it only validates them
+  (`_assert_public_http_url` / `_is_safe_image_url`) and returns them to
+  the renderer, which loads them as frontend `<img>` sources.
 - `strip_html` removes all markup before storage; the renderer renders
   plain text only. Do not add rich HTML rendering of feed content.
 - Policy rejections surface as `400 unsafe_url` (client error), distinct
   from upstream `502 fetch_failed`.
 - Any change touching fetch/redirect/validation/sanitization logic
-  **requires new adversarial tests** (see `tests/test_http.py`,
-  `tests/test_search.py` for the pattern: monkeypatch `_resolve_host_sync`
-  / `_http_fetch`, assert the gate).
+  **requires new adversarial tests** (see `tests/test_dns_pinning.py` for
+  the DNS-rebinding pattern: a fake network backend *below* the pin gate
+  observes exactly which IP each connection dials; also
+  `tests/test_http.py`, `tests/test_search.py`).
 
 ## Desktop guide (`desktop/plugin.js`)
 

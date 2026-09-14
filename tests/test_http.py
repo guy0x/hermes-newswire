@@ -2,7 +2,9 @@
 
 These exercise the real ``_http_fetch`` (not the fake) through an httpx
 MockTransport injected at the ``_build_async_client`` seam, with DNS pinned
-via the ``_resolve_host_sync`` seam. No real network is touched.
+via the ``_resolve_host_sync`` seam. No real network is touched. (The
+validation→connection boundary itself — DNS rebinding — is covered
+adversarially in ``test_dns_pinning.py`` at the network-backend layer.)
 """
 
 from __future__ import annotations

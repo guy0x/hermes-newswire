@@ -16,7 +16,11 @@ Design (M2 backend, Kanban t_e0c80073):
 * All fetches go through one seam — ``_http_fetch`` — which enforces the SSRF
   policy (http/https only, DNS-resolved IP allow-listing per hop, redirect
   target validation BEFORE following, ≤3 redirects, 5s connect / 15s total,
-  5 MB body cap).
+  5 MB body cap). Connections are PINNED to the validated addresses
+  (``_PinnedIPBackend``): the resolution the gate approved is the one dialed,
+  with no second DNS lookup between validation and the socket — DNS
+  rebinding/TOCTOU has no window. TLS SNI + certificate verification and the
+  HTTP Host header keep the original hostname.
 * Conditional GETs: per-source ``etag`` / ``last_modified`` persisted and sent
   as ``If-None-Match`` / ``If-Modified-Since``; 304 is a success (timestamps
   updated, no reparse).
@@ -367,8 +371,14 @@ def _ip_is_blocked(ip_text: str) -> bool:
     return False
 
 
-def _assert_public_http_url(url: str) -> None:
-    """Raise UnsafeURL unless url is http(s) and resolves to public IPs only."""
+def _resolve_validated_ips(url: str) -> list[str]:
+    """SSRF gate: return the addresses a URL may be contacted on, or raise.
+
+    Raise UnsafeURL unless url is http(s) and resolves to public IPs only.
+    The returned list is the *validated set*: every member passed the
+    public-IP policy, and — critically — nothing outside this list may be
+    dialed for this URL (see ``_PinnedIPBackend``).
+    """
     try:
         parts = urlsplit(url)
     except ValueError as exc:
@@ -389,6 +399,83 @@ def _assert_public_http_url(url: str) -> None:
     for ip_text in candidates:
         if _ip_is_blocked(ip_text):
             raise UnsafeURL(f"host resolves to non-public address: {host} -> {ip_text}")
+    return candidates
+
+
+def _assert_public_http_url(url: str) -> None:
+    """Raise UnsafeURL unless url is http(s) and resolves to public IPs only."""
+    _resolve_validated_ips(url)
+
+
+class _PinnedIPBackend:
+    """httpcore network backend that dials only SSRF-validated addresses.
+
+    Why this exists: validating a hostname (resolve → policy-check the IPs)
+    and then handing the *hostname* to httpx leaves a TOCTOU window — httpx
+    resolves the name a second time when opening the socket, and DNS may
+    answer differently on the second lookup (DNS rebinding): the gate
+    approves 93.184.216.34 while the connection lands on 127.0.0.1,
+    169.254.169.254, or RFC1918 space.
+
+    This backend closes the window structurally. ``connect_tcp`` is the only
+    place a socket gets opened on this client, and it dials exclusively
+    addresses from the pin table that ``_validate_and_pin`` filled — from the
+    very resolution the gate approved, for this exact hop, immediately before
+    the request. Hostnames are never re-resolved, so a rebinding answer has
+    nowhere to land. Anything unpinned fails closed with ConnectError;
+    nothing is ever dialed on trust.
+
+    TLS semantics are preserved by construction: only the dial address is
+    substituted. httpcore still calls ``start_tls(server_hostname=<original
+    host>)`` on the socket we return, so SNI and certificate verification
+    keep using the original hostname, and the HTTP Host header is untouched.
+    """
+
+    def __init__(self, delegate):
+        # ``delegate`` is the pool's original dialer (httpcore AutoBackend);
+        # tests substitute a recording double here.
+        import httpcore
+
+        self._httpcore = httpcore
+        self._delegate = delegate
+        self._pins: dict[str, tuple[str, ...]] = {}
+
+    def pin(self, host: str, ips: "list[str] | tuple[str, ...]") -> None:
+        """Bind a hostname to its validated address set for this fetch."""
+        if host and ips:
+            self._pins[host] = tuple(ips)
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ):
+        pins = self._pins.get(host)
+        if not pins:
+            raise self._httpcore.ConnectError(
+                f"refusing to connect to {host!r}: no SSRF-validated address pinned for this request"
+            )
+        last_exc: Exception | None = None
+        for ip in pins:  # fallback is allowed only *within* the validated set
+            try:
+                return await self._delegate.connect_tcp(
+                    ip, port, timeout=timeout,
+                    local_address=local_address, socket_options=socket_options,
+                )
+            except (self._httpcore.ConnectError, self._httpcore.ConnectTimeout) as exc:
+                last_exc = exc
+        assert last_exc is not None
+        raise last_exc
+
+    async def connect_unix_socket(self, path: str, timeout: float | None = None,
+                                  socket_options: Any = None):
+        raise self._httpcore.ConnectError("unix sockets are not permitted by the SSRF policy")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._delegate.sleep(seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -402,24 +489,58 @@ class FetchOutcome:
     url: str = ""  # final URL after redirects
 
 
+async def _validate_and_pin(url: str, backend: "_PinnedIPBackend | None") -> None:
+    """Resolve + SSRF-validate one hop URL, then pin the approved addresses.
+
+    This is the anti-DNS-rebinding core: the same resolution whose results
+    the gate approved is the one and only source the transport may dial for
+    this hop. There is deliberately no second DNS lookup between validation
+    and the network connection — ``_PinnedIPBackend.connect_tcp`` reads the
+    pin table filled here and dials straight to an approved IP.
+    """
+    candidates = await asyncio.to_thread(_resolve_validated_ips, url)
+    if backend is None:  # test-injected MockTransport client: gate only
+        return
+    keys = {urlsplit(url).hostname or ""}
+    try:  # authoritative key: exactly what httpcore passes to connect_tcp
+        import httpx
+
+        keys.add(str(httpx.URL(url).host))
+    except Exception:  # pragma: no cover - URL rejected above already
+        pass
+    for key in keys:
+        if key:
+            backend.pin(key, candidates)
+
+
 async def _http_fetch(url: str, *, headers: dict[str, str] | None = None) -> FetchOutcome:
-    """GET with SSRF-checked manual redirects, timeouts, and a 5 MB body cap.
+    """GET with SSRF-checked, IP-pinned manual redirects, timeouts, 5 MB cap.
+
+    Per hop: resolve → validate every address against the public-IP policy →
+    pin the validated set for this exact connection attempt → connect. The
+    pinned network backend (see ``_PinnedIPBackend``) makes it structurally
+    impossible for a fetch to land anywhere the gate did not approve — a URL
+    cannot be fetched until its destination IP has been resolved, validated,
+    and bound to that connection attempt. TLS SNI, certificate verification,
+    and the Host header all keep using the original hostname.
 
     Streaming: the body is consumed chunk-by-chunk and the cap aborts the
     transfer as soon as it is exceeded, so an oversized response is never
     buffered whole. Module seam: engine tests monkeypatch this whole function;
-    the transport-level behaviour is exercised in test_http.py through the
-    ``_build_async_client`` + ``_resolve_host_sync`` seams.
+    the transport-level behaviour is exercised in test_http.py and
+    test_dns_pinning.py through the ``_build_async_client`` +
+    ``_resolve_host_sync`` seams.
     """
     import httpx
 
     current = url
     hop_headers = dict(headers or {})
     client = _build_async_client()
+    pin_backend = getattr(client, "_newswire_pin_backend", None)
     try:
         async with client:
             for _hop in range(MAX_REDIRECTS + 1):
-                await _assert_public_http_url_sync(current)
+                await _validate_and_pin(current, pin_backend)
                 async with client.stream("GET", current, headers=hop_headers) as resp:
                     if resp.status_code in (301, 302, 303, 307, 308):
                         location = resp.headers.get("location")
@@ -451,15 +572,27 @@ async def _assert_public_http_url_sync(url: str) -> None:
 
 
 def _build_async_client():
-    """httpx client factory seam (tests inject MockTransport here)."""
+    """httpx client factory seam (tests inject MockTransport here).
+
+    Installs ``_PinnedIPBackend`` on the transport's connection pool so the
+    only dialer this client ever uses is the one that refuses unpinned hosts.
+    On AsyncClient the backend is reachable as ``client._newswire_pin_backend``
+    (the attribute ``_http_fetch`` reads to fill the per-hop pin table).
+    """
     import httpx
 
-    return httpx.AsyncClient(
+    client = httpx.AsyncClient(
         follow_redirects=False,
         trust_env=False,
         timeout=httpx.Timeout(TOTAL_TIMEOUT, connect=CONNECT_TIMEOUT),
         headers={"User-Agent": USER_AGENT, "Accept": "*/*"},
     )
+    pool = getattr(getattr(client, "_transport", None), "_pool", None)
+    if pool is not None and hasattr(pool, "_network_backend"):
+        backend = _PinnedIPBackend(pool._network_backend)
+        pool._network_backend = backend
+        client._newswire_pin_backend = backend
+    return client
 
 
 # ---------------------------------------------------------------------------
