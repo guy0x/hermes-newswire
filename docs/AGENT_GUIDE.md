@@ -85,6 +85,15 @@ chains, and HTML/script injection. Accordingly:
   dial address is substituted: TLS SNI and certificate verification use the
   original hostname (httpcore's `start_tls(server_hostname=<host>)`), and
   the HTTP `Host` header is untouched.
+- **Fail closed on transport changes.** The pin backend is installed
+  through an httpx/httpcore internal seam (`_transport._pool.
+  _network_backend`) because httpx 0.28 has no public resolver hook. If a
+  future httpx/httpcore release changes that shape, `_build_async_client`
+  raises and refuses outbound networking rather than returning an ordinary
+  client that would re-resolve hostnames itself — Newswire either connects
+  through the pinned transport or does not connect at all. The one
+  exemption is the explicit test seam (`_newswire_mock_transport`-flagged
+  MockTransport clients, which never open sockets).
 - Redirects repeat the whole cycle per hop: resolve → validate the new
   host's address set → pin → connect. A previous hop's approval is never
   reused for a different hostname (`MAX_REDIRECTS=3` still applies).

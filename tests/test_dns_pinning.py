@@ -269,6 +269,108 @@ async def test_unpinned_host_fails_closed(plugin, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Fail-closed when the pinned transport cannot be installed (review follow-up)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_client_construction_fails_closed_on_missing_seam(plugin, monkeypatch):
+    """_build_async_client must refuse to hand out an unpinnable client.
+
+    Simulates an incompatible httpx/httpcore build where the pool seam
+    (``_transport._pool._network_backend``) is gone: installation returns
+    None and client construction must raise rather than return an ordinary
+    httpx client that would re-resolve hostnames itself when dialing.
+    """
+    monkeypatch.setattr(plugin, "_install_pin_backend", lambda client: None)
+    with pytest.raises(RuntimeError, match="IP-pinning transport could not be installed"):
+        plugin._build_async_client()
+
+
+@pytest.mark.anyio
+async def test_http_fetch_fails_closed_without_pin_backend(plugin, monkeypatch):
+    """A client lacking the pin backend cannot fetch — no fallback dial.
+
+    The pre-fix fail-open path: a client whose transport could not be pinned
+    sailed through validation and then connected with ordinary httpx
+    behavior (validate -> re-resolve -> connect), restoring the rebind
+    window. The fetch must now refuse BEFORE resolving DNS or opening any
+    socket, and must never fall back to the pre-fix behavior.
+    """
+    dialer = RefusingDialer()
+    resolved: list[str] = []
+
+    def recording_dns(host):
+        resolved.append(host)
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(plugin, "_resolve_host_sync", recording_dns)
+
+    def build():
+        client = httpx.AsyncClient(
+            follow_redirects=False,
+            trust_env=False,
+            timeout=httpx.Timeout(plugin.TOTAL_TIMEOUT, connect=plugin.CONNECT_TIMEOUT),
+            headers={"User-Agent": plugin.USER_AGENT, "Accept": "*/*"},
+        )
+        # no _install_pin_backend call, no _newswire_mock_transport flag:
+        # exactly what an httpx internals change would leave us with.
+        return client
+
+    monkeypatch.setattr(plugin, "_build_async_client", build)
+
+    with pytest.raises(RuntimeError, match="IP-pinning transport unavailable"):
+        await plugin._http_fetch("https://unpinnable.example/feed")
+    assert dialer.ips == []   # no outbound socket was opened
+    assert resolved == []     # no DNS resolution occurred — not even the gate's
+
+
+@pytest.mark.anyio
+async def test_production_client_installs_backend_on_this_env(plugin):
+    """Sanity: the real production path still installs the backend here.
+
+    Guards against the fail-closed raising accidentally on the current
+    httpx/httpcore (i.e. the guard is reachable only when the seam is
+    genuinely absent, not always).
+    """
+    client = plugin._build_async_client()
+    try:
+        assert isinstance(client._newswire_pin_backend, plugin._PinnedIPBackend)
+        assert client._transport._pool._network_backend is client._newswire_pin_backend
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_mock_transport_seam_still_allowed(plugin, monkeypatch):
+    """The explicit test seam (flagged MockTransport) keeps working.
+
+    MockTransport never opens sockets, so a mock-flagged client may pass the
+    URL gate without a pin backend — but it must still fail if some future
+    change made the mock flag meaningless (no transport at all).
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"<rss version='2.0'><channel/></rss>")
+
+    def build():
+        client = httpx.AsyncClient(
+            follow_redirects=False,
+            trust_env=False,
+            timeout=httpx.Timeout(plugin.TOTAL_TIMEOUT, connect=plugin.CONNECT_TIMEOUT),
+            headers={"User-Agent": plugin.USER_AGENT, "Accept": "*/*"},
+            transport=httpx.MockTransport(handler),
+        )
+        client._newswire_mock_transport = True
+        return client
+
+    monkeypatch.setattr(plugin, "_build_async_client", build)
+    monkeypatch.setattr(plugin, "_resolve_host_sync", lambda host: ["93.184.216.34"])
+    out = await plugin._http_fetch("https://mockflag.example/feed")
+    assert out.status == 200
+
+
+
+
+# ---------------------------------------------------------------------------
 # Redirect hops: independent resolution + validation + pinning
 # ---------------------------------------------------------------------------
 
