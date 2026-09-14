@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from email.utils import format_datetime
 
 import pytest
 
@@ -346,8 +347,14 @@ def test_state_route(plugin, client):
 # --- Retention --------------------------------------------------------------------
 
 def test_retention_age(plugin, client, fake_fetch):
+    # Fresh article dated relative to "now" so the fixture never goes stale;
+    # old article predates every retention window (2024 < any cutoff).
+    from datetime import datetime, timedelta, timezone
+
+    fresh_dt = datetime.now(timezone.utc) - timedelta(hours=2)
+    fresh = ("<item><title>Fresh</title><link>https://example.com/new</link>"
+             f"<pubDate>{format_datetime(fresh_dt)}</pubDate></item>").encode()
     old = b"""<item><title>Old</title><link>https://example.com/old</link><pubDate>Mon, 01 Jan 2024 00:00:00 GMT</pubDate></item>"""
-    fresh = b"""<item><title>Fresh</title><link>https://example.com/new</link><pubDate>Sun, 13 Sep 2026 00:00:00 GMT</pubDate></item>"""
     client.patch(f"{PREFIX}/settings", json={"max_article_age_hours": 0})  # keep everything for now
     fake_fetch({"https://example.com/feed.xml": lambda h: ok(plugin, b"<rss version='2.0'><channel>" + old + fresh + b"</channel></rss>")})
     client.post(f"{PREFIX}/sources", json={"url": "https://example.com/feed.xml"})

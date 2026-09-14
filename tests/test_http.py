@@ -2,7 +2,9 @@
 
 These exercise the real ``_http_fetch`` (not the fake) through an httpx
 MockTransport injected at the ``_build_async_client`` seam, with DNS pinned
-via the ``_resolve_host_sync`` seam. No real network is touched.
+via the ``_resolve_host_sync`` seam. No real network is touched. (The
+validation→connection boundary itself — DNS rebinding — is covered
+adversarially in ``test_dns_pinning.py`` at the network-backend layer.)
 """
 
 from __future__ import annotations
@@ -14,15 +16,23 @@ from conftest import RSS2
 
 
 def install_transport(plugin, monkeypatch, handler, *, resolve=None):
-    """Wire an httpx.MockTransport + deterministic DNS into the real fetcher."""
+    """Wire an httpx.MockTransport + deterministic DNS into the real fetcher.
+
+    The mock client is flagged ``_newswire_mock_transport`` — the ONLY
+    condition under which ``_http_fetch`` tolerates a missing pin backend
+    (MockTransport never opens sockets, so there is nothing to pin). A
+    production client without the pin backend fails closed instead.
+    """
     def build():
-        return httpx.AsyncClient(
+        client = httpx.AsyncClient(
             follow_redirects=False,
             trust_env=False,
             timeout=httpx.Timeout(plugin.TOTAL_TIMEOUT, connect=plugin.CONNECT_TIMEOUT),
             headers={"User-Agent": plugin.USER_AGENT, "Accept": "*/*"},
             transport=httpx.MockTransport(handler),
         )
+        client._newswire_mock_transport = True
+        return client
 
     monkeypatch.setattr(plugin, "_build_async_client", build)
     if resolve is not None:

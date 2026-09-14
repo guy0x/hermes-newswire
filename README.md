@@ -6,7 +6,7 @@
 [![Support the Project](https://img.shields.io/badge/Support_the_Project-X%20Money-black?style=for-the-badge&logo=x&logoColor=white)](https://x.com/tonysimons_)
 [![](https://img.shields.io/badge/tonysimons.dev-111827?style=for-the-badge&logo=googlechrome&logoColor=white)](https://tonysimons.dev)
 [![License: MIT](https://img.shields.io/badge/license-MIT-6c63ff?style=for-the-badge)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-102%20passed-brightgreen?style=for-the-badge)](#test--verify)
+[![Tests](https://img.shields.io/badge/tests-119%20passed-brightgreen?style=for-the-badge)](#test--verify)
 [![Zero API keys](https://img.shields.io/badge/zero-API%20keys-00d26a?style=for-the-badge)](#security)
 [![No LLM tokens](https://img.shields.io/badge/routine%20ops-no%20model%20tokens-00d26a?style=for-the-badge)](#security)
 
@@ -78,4 +78,4 @@ Quick gates before any PR: `env -u PYTHONPATH <hermes-venv>/bin/python -m pytest
 
 ## Status
 
-v0.1.0 — feature-complete (backend, page, ticker, hardening, search, favicons, grouping) with an independent QA-gated history. 102-test suite + ESM render smoke. Built as a standalone unified plugin against the Hermes Desktop plugin SDK (catalog submission pending).
+v0.1.0 — feature-complete (backend, page, ticker, hardening, search, favicons, grouping) with an independent QA-gated history. 119-test suite + ESM render smoke. Built as a standalone unified plugin against the Hermes Desktop plugin SDK (catalog submission pending).
