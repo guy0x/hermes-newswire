@@ -632,6 +632,17 @@ function ArticleRow({ a }) {
 
 const PAGE_SIZE = 50
 
+// Group-header row for "By source" grouping. Extracted so the favicon can
+// go through useIconDataUrl (hooks are illegal inside .map callbacks).
+function SectionHeader({ favicon, name, count }) {
+  const iconSrc = useIconDataUrl(favicon)
+  return jsxs('div', { className: `${ID}-section`, children: [
+    iconSrc ? jsx('img', { src: iconSrc, className: `${ID}-favicon`, alt: '' }) : null,
+    jsx('span', { children: name }),
+    jsx('span', { className: `${ID}-sectioncount`, children: `${count}` })
+  ] })
+}
+
 function LatestTab({ sources, prefs, setPrefs }) {
   const [q, setQ] = useState(prefs.search || '')
   const [sourceId, setSourceId] = useState(prefs.sourceId || 'all')
@@ -762,11 +773,7 @@ function LatestTab({ sources, prefs, setPrefs }) {
             : sections.every(s => s.list.length === 0)
               ? jsx('div', { className: 'grid h-full place-items-center p-4', children: jsx(EmptyState, { title: needle ? 'No matching headlines' : 'No articles yet', description: needle ? 'Try a different search.' : 'Add a source and refresh.' }) })
               : jsx('div', { className: `${ID}-list`, children: sections.map((sec, si) => jsxs('div', { 'data-section': si, children: [
-                  sec.name ? jsxs('div', { className: `${ID}-section`, children: [
-                    sec.favicon ? jsx('img', { src: sec.favicon, className: `${ID}-favicon`, alt: '' }) : null,
-                    jsx('span', { children: sec.name }),
-                    jsx('span', { className: `${ID}-sectioncount`, children: `${sec.list.length}` })
-                  ] }) : null,
+                  sec.name ? jsx(SectionHeader, { favicon: sec.favicon, name: sec.name, count: sec.list.length }) : null,
                   ...sec.list.map(a => jsx(ArticleRow, { a, key: a.id }))
                 ] }, `sec${si}`)) })
       })
@@ -1087,16 +1094,10 @@ function SourcesTab({ sources, onChanged, autofocusAdd }) {
 
 function SettingsTab() {
   const [settingsQ, s] = useSettings()
-  // Save-error state must be declared BEFORE the error early return below:
-  // hook order is invariant across renders (a return between hooks makes the
-  // hook count depend on settingsQ.isError — React "rendered fewer hooks").
+  // All hooks run BEFORE the error early return below: hook order must be
+  // invariant across renders (useSettings polls, so isError flips at runtime;
+  // a return between hooks = React "rendered fewer hooks" crash).
   const [saveError, setSaveError] = useState('')
-  if (settingsQ?.isError) return jsx('div', { className: `${ID}-page`, children:
-    jsx('div', { className: `${ID}-scrollwrap`, children:
-      jsx(QueryErrorBanner, { q: settingsQ, label: 'settings' })
-    })
-  })
-  openArticleMode = s?.open_article_behavior === 'external' ? 'external' : 'internal'
   const save = useMutation({
     mutationFn: patch => rest('/settings', { method: 'PATCH', body: patch }),
     onSuccess: (_data, patch) => {
@@ -1113,6 +1114,12 @@ function SettingsTab() {
       host.notifyError(e, 'Newswire: could not save settings')
     }
   })
+  if (settingsQ?.isError) return jsx('div', { className: `${ID}-page`, children:
+    jsx('div', { className: `${ID}-scrollwrap`, children:
+      jsx(QueryErrorBanner, { q: settingsQ, label: 'settings' })
+    })
+  })
+  openArticleMode = s?.open_article_behavior === 'external' ? 'external' : 'internal'
   if (!s) return jsx('div', { className: 'grid h-full place-items-center p-4', children: jsx(GlyphSpinner, {}) })
 
   const Toggle = ({ label, k }) => jsxs('div', { className: `${ID}-setrow`, children: [

@@ -538,9 +538,12 @@ await flush()
 deepRerender(pageNode)
 const vbChip = findButtons(pageNode, n => directText(n).startsWith('+ '))
   .find(c => directText(c).includes('VentureBeat AI'))
-vbChip.props.onClick()
-await flush()
-deepRerender(pageNode)
+check(!!vbChip, 'VentureBeat AI chip exists for failure test')
+if (vbChip) {
+  vbChip.props.onClick()
+  await flush()
+  deepRerender(pageNode)
+}
 const pageText = textOf(pageNode)
 check(pageText.includes('VentureBeat AI could not be added'), 'failed add shows actionable inline error')
 check(pageText.includes('HTTP 429'), 'error carries the backend detail (HTTP 429)')
@@ -580,7 +583,7 @@ pendingChips[0] && pendingChips[0].props.onClick && pendingChips[0].props.onClic
 await flush()
 const postCount2 = restLog.filter(c => c.opts && c.opts.method === 'POST').length
 check(postCount1 === 1 && postCount2 === 1, 'second click while pending does not re-POST')
-releasePost({ id: 2, ok: true })
+if (releasePost) releasePost({ id: 2, ok: true })
 await flush()
 
 // Duplicate response (409) renders the friendly message

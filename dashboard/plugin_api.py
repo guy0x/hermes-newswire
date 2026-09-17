@@ -106,6 +106,7 @@ ICON_ALLOWED_CONTENT_TYPES = (
     "image/x-icon", "image/vnd.microsoft.icon", "image/svg+xml",
 )
 ICON_CACHE_TTL_SECONDS = 24 * 3600
+ICON_NEGATIVE_TTL_SECONDS = 2 * 60  # failed icon fetches retry sooner
 CONNECT_TIMEOUT = 5.0
 TOTAL_TIMEOUT = 15.0
 MAX_BODY_BYTES = 5 * 1024 * 1024        # 5 MB
@@ -1899,6 +1900,12 @@ async def get_icon(url: str = Query(...)) -> dict[str, Any]:
         fetch_error = f"{type(exc).__name__}: {exc}"[:200]
         logger.warning("icon proxy fetch failed for %s: %s", url, fetch_error)
 
+    # Icons are far smaller than feeds: anything above the icon cap is treated
+    # as "no icon" rather than proxying feed-sized bodies to the renderer.
+    if out is not None and len(out.body) > ICON_MAX_BODY_BYTES:
+        logger.warning("icon proxy: %s body %d bytes exceeds %d cap", url, len(out.body), ICON_MAX_BODY_BYTES)
+        out = None
+
     ctype = (out.headers.get("content-type", "") if out else "").split(";")[0].strip().lower()
     data_url: str | None = None
     if (
@@ -1910,13 +1917,16 @@ async def get_icon(url: str = Query(...)) -> dict[str, Any]:
     ):
         data_url = f"data:{ctype};base64,{base64.b64encode(out.body).decode('ascii')}"
 
+    # Negative results cache 10× shorter: a transient icon-host blip or a
+    # briefly-down backend shouldn't hide an icon for a full day.
+    ttl = ICON_NEGATIVE_TTL_SECONDS if data_url is None else ICON_CACHE_TTL_SECONDS
     async with _ICON_CACHE_LOCK:
         if len(_ICON_CACHE) >= _ICON_CACHE_MAX_ENTRIES and cache_key not in _ICON_CACHE:
             # FIFO eviction of the oldest third — keeps the map bounded under
             # unique-URL rotation without per-entry bookkeeping.
             for old_key in sorted(_ICON_CACHE, key=lambda k: _ICON_CACHE[k][0])[: max(1, _ICON_CACHE_MAX_ENTRIES // 3)]:
                 _ICON_CACHE.pop(old_key, None)
-        _ICON_CACHE[cache_key] = (time.time() + ICON_CACHE_TTL_SECONDS, data_url)
+        _ICON_CACHE[cache_key] = (time.time() + ttl, data_url)
     resp: dict[str, Any] = {"url": url, "data_url": data_url}
     if fetch_error:
         resp["error"] = fetch_error
