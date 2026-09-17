@@ -364,7 +364,10 @@ function useIconDataUrl(u) {
       return (out && out.data_url) || null
     },
     enabled: !!u,
-    staleTime: 24 * 3600_000, // mirrors backend ICON_CACHE_TTL_SECONDS
+    // Mirror the backend's shorter NEGATIVE TTL: a null (failed icon) must
+    // retry soon rather than pin the fallback dot for a day. Positive
+    // data_urls stay fresh for the backend's full 24 h TTL.
+    staleTime: 2 * 60_000,
     retry: 0
   })
   return u ? (q.data || null) : null
@@ -387,8 +390,7 @@ function TickerItem({ a, settings }) {
       style: { display: 'inline-flex', alignItems: 'center', gap: '0.375rem' },
       children: [
         iconSrc
-          ? jsx('img', { src: iconSrc, className: `${ID}-favicon`, alt: '',
-              onError: e => { e.currentTarget.style.display = 'none' } })
+          ? jsx(Favicon, { url: a.favicon_url })
           : jsx('span', { className: `${ID}-dot`, children: '◆' }),
         settings?.show_source !== false ? jsx('span', { className: `${ID}-src`, children: `${a.source_name}:` }) : null,
         jsx('span', { className: `${ID}-headline`, children: a.title }),
@@ -596,8 +598,7 @@ function ArticleRow({ a }) {
         }),
         a.summary ? jsx('div', { className: `${ID}-rowsum`, children: a.summary }) : null,
         jsxs('div', { className: `${ID}-meta`, children: [
-          iconSrc ? jsx('img', { src: iconSrc, className: `${ID}-favicon`, alt: '',
-            onError: e => { e.currentTarget.style.display = 'none' } }) : null,
+          jsx(Favicon, { url: a.favicon_url }),
           jsx('span', { children: a.source_name }),
           a.read ? jsx('span', { children: '· read' }) : null,
           jsx('span', { title: absTime(a.published_at), children: relTime(a.published_at) || '—' })
@@ -634,10 +635,18 @@ const PAGE_SIZE = 50
 
 // Group-header row for "By source" grouping. Extracted so the favicon can
 // go through useIconDataUrl (hooks are illegal inside .map callbacks).
+// Shared favicon renderer: data: URL via the backend proxy, hidden on
+// decode failure so a broken image glyph never appears.
+function Favicon({ url }) {
+  const iconSrc = useIconDataUrl(url)
+  if (!iconSrc) return null
+  return jsx('img', { src: iconSrc, className: `${ID}-favicon`, alt: '',
+    onError: e => { e.currentTarget.style.display = 'none' } })
+}
+
 function SectionHeader({ favicon, name, count }) {
-  const iconSrc = useIconDataUrl(favicon)
   return jsxs('div', { className: `${ID}-section`, children: [
-    iconSrc ? jsx('img', { src: iconSrc, className: `${ID}-favicon`, alt: '' }) : null,
+    jsx(Favicon, { url: favicon }),
     jsx('span', { children: name }),
     jsx('span', { className: `${ID}-sectioncount`, children: `${count}` })
   ] })

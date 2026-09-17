@@ -533,7 +533,8 @@ async def _validate_and_pin(url: str, backend: "_PinnedIPBackend | None") -> Non
             backend.pin(key, candidates)
 
 
-async def _http_fetch(url: str, *, headers: dict[str, str] | None = None) -> FetchOutcome:
+async def _http_fetch(url: str, *, headers: dict[str, str] | None = None,
+                      max_bytes: int = MAX_BODY_BYTES) -> FetchOutcome:
     """GET with SSRF-checked, IP-pinned manual redirects, timeouts, 5 MB cap.
 
     Per hop: resolve → validate every address against the public-IP policy →
@@ -582,8 +583,8 @@ async def _http_fetch(url: str, *, headers: dict[str, str] | None = None) -> Fet
                     body = b""
                     async for chunk in resp.aiter_bytes():
                         body += chunk
-                        if len(body) > MAX_BODY_BYTES:
-                            raise UnsafeURL(f"response body exceeds {MAX_BODY_BYTES} bytes")
+                        if len(body) > max_bytes:
+                            raise UnsafeURL(f"response body exceeds {max_bytes} bytes")
                     return FetchOutcome(
                         status=resp.status_code,
                         headers={k.lower(): v for k, v in resp.headers.items()},
@@ -1890,7 +1891,7 @@ async def get_icon(url: str = Query(...)) -> dict[str, Any]:
 
     fetch_error: str | None = None
     try:
-        out = await _http_fetch(url)
+        out = await _http_fetch(url, max_bytes=ICON_MAX_BODY_BYTES)
     except UnsafeURL as exc:
         raise _err(400, "unsafe_url", str(exc)) from exc
     except Exception as exc:
@@ -1922,8 +1923,9 @@ async def get_icon(url: str = Query(...)) -> dict[str, Any]:
     ttl = ICON_NEGATIVE_TTL_SECONDS if data_url is None else ICON_CACHE_TTL_SECONDS
     async with _ICON_CACHE_LOCK:
         if len(_ICON_CACHE) >= _ICON_CACHE_MAX_ENTRIES and cache_key not in _ICON_CACHE:
-            # FIFO eviction of the oldest third — keeps the map bounded under
-            # unique-URL rotation without per-entry bookkeeping.
+            # Evict the entries expiring soonest (≈oldest first: positive
+            # entries share one TTL, negatives a shorter one) — keeps the map
+            # bounded under unique-URL rotation without per-entry bookkeeping.
             for old_key in sorted(_ICON_CACHE, key=lambda k: _ICON_CACHE[k][0])[: max(1, _ICON_CACHE_MAX_ENTRIES // 3)]:
                 _ICON_CACHE.pop(old_key, None)
         _ICON_CACHE[cache_key] = (time.time() + ttl, data_url)
