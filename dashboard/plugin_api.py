@@ -1901,11 +1901,6 @@ async def get_icon(url: str = Query(...)) -> dict[str, Any]:
         fetch_error = f"{type(exc).__name__}: {exc}"[:200]
         logger.warning("icon proxy fetch failed for %s: %s", url, fetch_error)
 
-    # Icons are far smaller than feeds: anything above the icon cap is treated
-    # as "no icon" rather than proxying feed-sized bodies to the renderer.
-    if out is not None and len(out.body) > ICON_MAX_BODY_BYTES:
-        logger.warning("icon proxy: %s body %d bytes exceeds %d cap", url, len(out.body), ICON_MAX_BODY_BYTES)
-        out = None
 
     ctype = (out.headers.get("content-type", "") if out else "").split(";")[0].strip().lower()
     data_url: str | None = None

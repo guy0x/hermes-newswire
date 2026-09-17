@@ -389,7 +389,7 @@ function TickerItem({ a, settings }) {
     children: jsxs('span', {
       style: { display: 'inline-flex', alignItems: 'center', gap: '0.375rem' },
       children: [
-        iconSrc
+        a.favicon_url
           ? jsx(Favicon, { url: a.favicon_url })
           : jsx('span', { className: `${ID}-dot`, children: '◆' }),
         settings?.show_source !== false ? jsx('span', { className: `${ID}-src`, children: `${a.source_name}:` }) : null,
@@ -584,7 +584,6 @@ function NewswireTicker() {
 // ─────────────────────────────────────────────────────────────────────────
 
 function ArticleRow({ a }) {
-  const iconSrc = useIconDataUrl(a.favicon_url)
   return jsxs('div', { className: `${ID}-row`, 'data-read': a.read ? '1' : '0', children: [
     jsx('div', {
       className: `${ID}-rowmain`,
