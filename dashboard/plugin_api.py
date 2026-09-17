@@ -56,13 +56,16 @@ Routes (all under /api/plugins/hermes-newswire/):
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import html as html_mod
 import ipaddress
 import json
+import logging
 import re
 import socket
 import sqlite3
+import time
 import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass, field
@@ -85,6 +88,7 @@ except Exception:  # pragma: no cover - defensive fallback
 
 PLUGIN_VERSION = "0.1.0"
 USER_AGENT = f"hermes-newswire/{PLUGIN_VERSION} (+https://github.com/NousResearch/hermes-agent)"
+logger = logging.getLogger("hermes.plugins.newswire")
 
 # ---------------------------------------------------------------------------
 # Tunables / policy constants
@@ -92,6 +96,16 @@ USER_AGENT = f"hermes-newswire/{PLUGIN_VERSION} (+https://github.com/NousResearc
 DEFAULT_REFRESH_INTERVAL = 300          # seconds; per-source override supported
 REFRESHER_GRANULARITY = 15              # background loop tick
 MAX_REDIRECTS = 3
+# Favicon proxy (GET /icon.json): tiny by design — an icon is not a feed.
+# Renderer <img> fetches bypass the pinned transport entirely (the SDK exposes
+# no raw-bytes door), so icons are fetched HERE through the same SSRF gate +
+# validated-IP pinning as feeds, then handed to the renderer as a data URL.
+ICON_MAX_BODY_BYTES = 64 * 1024
+ICON_ALLOWED_CONTENT_TYPES = (
+    "image/png", "image/jpeg", "image/webp", "image/gif",
+    "image/x-icon", "image/vnd.microsoft.icon", "image/svg+xml",
+)
+ICON_CACHE_TTL_SECONDS = 24 * 3600
 CONNECT_TIMEOUT = 5.0
 TOTAL_TIMEOUT = 15.0
 MAX_BODY_BYTES = 5 * 1024 * 1024        # 5 MB
@@ -1818,3 +1832,69 @@ async def open_in_preview(payload: dict[str, Any] = Body(...)) -> dict[str, Any]
         "preview.open", {"url": url, "label": label or url}
     )
     return {"opened": url}
+
+
+# ---------------------------------------------------------------------------
+# Favicon proxy (issue: renderer <img> fetches bypass the pinned transport)
+# ---------------------------------------------------------------------------
+
+_ICON_CACHE: dict[str, tuple[float, str | None]] = {}
+_ICON_CACHE_LOCK = asyncio.Lock()
+
+
+@router.get("/icon.json")
+async def get_icon(url: str = Query(...)) -> dict[str, Any]:
+    """Fetch a remote icon through the SSRF gate + pinned transport and return
+    it as a ``data:`` URL.
+
+    Why this exists: favicon URLs are attacker-controlled network input too,
+    but the renderer loads them with plain ``<img src>`` — a second, unpinned
+    DNS resolution outside the validated transport (independently reported as
+    issue #6). The SDK's ``rest`` door is JSON-only, so the bytes ride back
+    base64-encoded instead of raw.
+
+    Policy: URL validated by ``_assert_public_http_url`` (which the fetch
+    re-validates per hop, pinned to the validated address set), image
+    content-type allowlist, 64 KB body cap, and a 24 h in-process TTL cache so
+    the marquee's repeated rows do not refetch per render. Failures return
+    ``{"data_url": null}`` — the renderer already hides broken images.
+    """
+    async with _ICON_CACHE_LOCK:
+        cached = _ICON_CACHE.get(url)
+        if cached and cached[0] > time.time():
+            return {"url": url, "data_url": cached[1]}
+
+    try:
+        await _assert_public_http_url_sync(url)
+    except UnsafeURL as exc:
+        raise _err(400, "unsafe_url", str(exc)) from exc
+
+    fetch_error: str | None = None
+    try:
+        out = await _http_fetch(url)
+    except UnsafeURL as exc:
+        raise _err(400, "unsafe_url", str(exc)) from exc
+    except Exception as exc:
+        out = None
+        # Never raise for a broken icon — but do not swallow the reason either:
+        # a silent null here is indistinguishable from a dead source.
+        fetch_error = f"{type(exc).__name__}: {exc}"[:200]
+        logger.warning("icon proxy fetch failed for %s: %s", url, fetch_error)
+
+    ctype = (out.headers.get("content-type", "") if out else "").split(";")[0].strip().lower()
+    data_url: str | None = None
+    if (
+        out is not None
+        and out.status == 200
+        and ctype in ICON_ALLOWED_CONTENT_TYPES
+        and out.body
+        and len(out.body) <= ICON_MAX_BODY_BYTES
+    ):
+        data_url = f"data:{ctype};base64,{base64.b64encode(out.body).decode('ascii')}"
+
+    async with _ICON_CACHE_LOCK:
+        _ICON_CACHE[url] = (time.time() + ICON_CACHE_TTL_SECONDS, data_url)
+    resp: dict[str, Any] = {"url": url, "data_url": data_url}
+    if fetch_error:
+        resp["error"] = fetch_error
+    return resp

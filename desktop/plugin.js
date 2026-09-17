@@ -231,6 +231,21 @@ function errText(e) {
   return raw.slice(0, 300)
 }
 
+// Shared banner for a failed page-level query (settings, sources). Before
+// this, a query that never resolved rendered as an eternal spinner — the
+// user-visible symptom of "Settings does nothing" when the backend is
+// missing, disabled, or the serve child predates the plugin. The banner
+// names the failure and the fix instead.
+function QueryErrorBanner({ q, label }) {
+  if (!q || !q.isError) return null
+  return jsxs('div', { className: `${ID}-card`, style: { borderColor: 'var(--ui-red, #e5484d)' }, children: [
+    jsx('div', { className: `${ID}-setlabel`, style: { fontSize: '0.8125rem', color: 'var(--ui-red, #e5484d)', fontWeight: 600 }, children: `Could not reach the Newswire backend (${label})` }),
+    jsx('div', { className: `${ID}-err`, children: errText(q.error) || 'request failed' }),
+    jsx('div', { className: 'text-xs text-(--ui-text-quaternary)', children: 'Check that hermes-newswire is installed (~/.hermes/plugins/hermes-newswire) and listed under plugins.enabled in ~/.hermes/config.yaml, then restart Hermes Desktop so the backend mounts. Settings and sources need the backend; the ticker alone cannot save changes.' }),
+    jsx('div', { style: { paddingTop: '0.25rem' }, children: jsx(Button, { size: 'xs', variant: 'ghost', onClick: () => { try { q.refetch() } catch { /* stub-safe */ } }, children: 'Retry' }) })
+  ]})
+}
+
 // open_article_behavior: 'internal' (default, Tony's pref) opens in the
 // Hermes preview pane via the plugin backend's SSRF-gated /preview route,
 // which emits the same preview.open gateway event the app's own
@@ -334,6 +349,16 @@ function useSources() {
 // Ticker (statusbar)
 // ─────────────────────────────────────────────────────────────────────────
 
+// Favicon <img> sources go through the backend's SSRF-gated, pinned-transport
+// icon proxy (/icon.json → data: URL). A direct https favicon URL would be a
+// second, unpinned DNS resolution in the renderer — outside every gate the
+// backend enforces (issue #6). Proxy failures return data_url:null → render
+// the fallback dot.
+function iconProxySrc(u) {
+  if (!u || typeof u !== 'string') return ''
+  return `/icon.json?url=${encodeURIComponent(u)}`
+}
+
 function TickerItem({ a, settings }) {
   const age = settings?.relative_time !== false ? relTime(a.published_at) : ''
   return jsx('button', {
@@ -350,7 +375,7 @@ function TickerItem({ a, settings }) {
       style: { display: 'inline-flex', alignItems: 'center', gap: '0.375rem' },
       children: [
         a.favicon_url
-          ? jsx('img', { src: a.favicon_url, className: `${ID}-favicon`, alt: '',
+          ? jsx('img', { src: iconProxySrc(a.favicon_url), className: `${ID}-favicon`, alt: '',
               onError: e => { e.currentTarget.style.display = 'none' } })
           : jsx('span', { className: `${ID}-dot`, children: '◆' }),
         settings?.show_source !== false ? jsx('span', { className: `${ID}-src`, children: `${a.source_name}:` }) : null,
@@ -558,7 +583,7 @@ function ArticleRow({ a }) {
         }),
         a.summary ? jsx('div', { className: `${ID}-rowsum`, children: a.summary }) : null,
         jsxs('div', { className: `${ID}-meta`, children: [
-          a.favicon_url ? jsx('img', { src: a.favicon_url, className: `${ID}-favicon`, alt: '',
+          a.favicon_url ? jsx('img', { src: iconProxySrc(a.favicon_url), className: `${ID}-favicon`, alt: '',
             onError: e => { e.currentTarget.style.display = 'none' } }) : null,
           jsx('span', { children: a.source_name }),
           a.read ? jsx('span', { children: '· read' }) : null,
@@ -927,6 +952,7 @@ function SourceRow({ s, onChanged }) {
 }
 
 function SourcesTab({ sources, onChanged, autofocusAdd }) {
+  const [sourcesQ] = useSources()
   const refreshAll = useMutation({
     mutationFn: () => rest('/refresh-all', { method: 'POST', body: {} }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: [ID] })
@@ -951,7 +977,41 @@ function SourcesTab({ sources, onChanged, autofocusAdd }) {
     }
   }
 
+  // Starter-feed clicks. The original swallowed every failure with
+  // `catch { /* surfaced on refetch */ }` — nothing refetches after a failed
+  // add, so a blocked/429/duplicate click did literally nothing on screen
+  // (user report: "clicking VentureBeat does nothing"). Now: a per-feed
+  // pending flag disables the chip while in flight (no double-submit), and
+  // failures render an actionable inline error.
+  const [starterError, setStarterError] = useState('')
+  const [pendingFeeds, setPendingFeeds] = useState({})
+  const addStarterFeed = async f => {
+    if (pendingFeeds[f.feed_url]) return // in-flight guard: no duplicate submits
+    setStarterError('')
+    setPendingFeeds(p => ({ ...p, [f.feed_url]: true }))
+    try {
+      await rest('/sources', { method: 'POST', body: { feed_url: f.feed_url, name: f.name, category: f.category } })
+      onChanged()
+    } catch (e) {
+      const detail = errText(e) || 'request failed'
+      const raw = String(e?.message || e || '')
+      // Backend signals duplicates as code "duplicate" (409) with a message
+      // like "source already exists (id 3) for …" — match either shape.
+      const isDup = /duplicate|already exists/i.test(detail) || /"code"\s*:\s*"duplicate"/i.test(raw)
+      const hint = isDup
+        ? `${f.name} is already in your sources.`
+        : `${f.name} could not be added: ${detail}`
+      setStarterError(hint)
+    } finally {
+      setPendingFeeds(p => {
+        const { [f.feed_url]: _done, ...remaining } = p
+        return remaining
+      })
+    }
+  }
+
   return jsxs('div', { className: `${ID}-page`, children: [
+    sourcesQ?.isError ? jsx(QueryErrorBanner, { q: sourcesQ, label: 'sources' }) : null,
     jsxs('div', { className: `${ID}-tabs`, children: [
       jsx('span', { className: 'text-sm text-(--ui-text-primary)', children: `Sources (${sources.length})` }),
       jsx('span', { style: { flex: 1 } }),
@@ -992,14 +1052,14 @@ function SourcesTab({ sources, onChanged, autofocusAdd }) {
                 jsx('span', { className: 'text-xs text-(--ui-text-quaternary)', children: 'Pick any to subscribe — nothing is added without your click.' }),
                 jsx('div', { className: `${ID}-chips`, children: STARTER_FEEDS.map(f => jsxs('button', {
                   className: `${ID}-chip`,
-                  onClick: async () => {
-                    try {
-                      await rest('/sources', { method: 'POST', body: { feed_url: f.feed_url, name: f.name, category: f.category } })
-                      onChanged()
-                    } catch { /* surfaced on refetch */ }
-                  },
+                  'data-pending': pendingFeeds[f.feed_url] ? '1' : '0',
+                  disabled: !!pendingFeeds[f.feed_url],
+                  onClick: () => { void addStarterFeed(f) },
                   children: [`+ ${f.name}`, jsx(Badge, { variant: 'outline', children: f.category })]
-                }, f.feed_url)) })
+                }, f.feed_url)) }),
+                starterError
+                  ? jsx('div', { className: `${ID}-err`, role: 'alert', children: starterError })
+                  : null
               ]})
             : jsx('div', { className: `${ID}-list`, children: sources.map(s => jsx(SourceRow, { s, key: s.id, onChanged })) })
         ]})
@@ -1014,15 +1074,27 @@ function SourcesTab({ sources, onChanged, autofocusAdd }) {
 
 function SettingsTab() {
   const [settingsQ, s] = useSettings()
+  if (settingsQ?.isError) return jsx('div', { className: `${ID}-page`, children:
+    jsx('div', { className: `${ID}-scrollwrap`, children:
+      jsx(QueryErrorBanner, { q: settingsQ, label: 'settings' })
+    })
+  })
   openArticleMode = s?.open_article_behavior === 'external' ? 'external' : 'internal'
+  const [saveError, setSaveError] = useState('')
   const save = useMutation({
     mutationFn: patch => rest('/settings', { method: 'PATCH', body: patch }),
     onSuccess: (_data, patch) => {
+      setSaveError('')
       queryClient.invalidateQueries({ queryKey: [ID, 'settings'] })
       // Pane registration follows ticker_enabled / ticker_font_size live.
       if (patch && ('ticker_enabled' in patch || 'ticker_font_size' in patch) && applyTickerSettingsFn) {
         applyTickerSettingsFn({ ...s, ...patch })
       }
+    },
+    onError: e => {
+      const msg = errText(e) || 'could not save setting'
+      setSaveError(msg)
+      host.notifyError(e, 'Newswire: could not save settings')
     }
   })
   if (!s) return jsx('div', { className: 'grid h-full place-items-center p-4', children: jsx(GlyphSpinner, {}) })
@@ -1086,6 +1158,7 @@ function SettingsTab() {
               ]
             })
           ]}),
+          saveError ? jsx('div', { className: `${ID}-err`, role: 'alert', children: `Could not save setting: ${saveError}` }) : null,
           jsx(Toggle, { label: 'Show source name', k: 'show_source' }),
           jsx(Toggle, { label: 'Show relative time', k: 'relative_time' }),
           jsx(Toggle, { label: 'Only show unread', k: 'only_unread' }),
