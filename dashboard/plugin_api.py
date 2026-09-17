@@ -56,13 +56,16 @@ Routes (all under /api/plugins/hermes-newswire/):
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import html as html_mod
 import ipaddress
 import json
+import logging
 import re
 import socket
 import sqlite3
+import time
 import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass, field
@@ -85,6 +88,7 @@ except Exception:  # pragma: no cover - defensive fallback
 
 PLUGIN_VERSION = "0.1.0"
 USER_AGENT = f"hermes-newswire/{PLUGIN_VERSION} (+https://github.com/NousResearch/hermes-agent)"
+logger = logging.getLogger("hermes.plugins.newswire")
 
 # ---------------------------------------------------------------------------
 # Tunables / policy constants
@@ -92,6 +96,17 @@ USER_AGENT = f"hermes-newswire/{PLUGIN_VERSION} (+https://github.com/NousResearc
 DEFAULT_REFRESH_INTERVAL = 300          # seconds; per-source override supported
 REFRESHER_GRANULARITY = 15              # background loop tick
 MAX_REDIRECTS = 3
+# Favicon proxy (GET /icon.json): tiny by design — an icon is not a feed.
+# Renderer <img> fetches bypass the pinned transport entirely (the SDK exposes
+# no raw-bytes door), so icons are fetched HERE through the same SSRF gate +
+# validated-IP pinning as feeds, then handed to the renderer as a data URL.
+ICON_MAX_BODY_BYTES = 64 * 1024
+ICON_ALLOWED_CONTENT_TYPES = (
+    "image/png", "image/jpeg", "image/webp", "image/gif",
+    "image/x-icon", "image/vnd.microsoft.icon", "image/svg+xml",
+)
+ICON_CACHE_TTL_SECONDS = 24 * 3600
+ICON_NEGATIVE_TTL_SECONDS = 2 * 60  # failed icon fetches retry sooner
 CONNECT_TIMEOUT = 5.0
 TOTAL_TIMEOUT = 15.0
 MAX_BODY_BYTES = 5 * 1024 * 1024        # 5 MB
@@ -518,7 +533,8 @@ async def _validate_and_pin(url: str, backend: "_PinnedIPBackend | None") -> Non
             backend.pin(key, candidates)
 
 
-async def _http_fetch(url: str, *, headers: dict[str, str] | None = None) -> FetchOutcome:
+async def _http_fetch(url: str, *, headers: dict[str, str] | None = None,
+                      max_bytes: int = MAX_BODY_BYTES) -> FetchOutcome:
     """GET with SSRF-checked, IP-pinned manual redirects, timeouts, 5 MB cap.
 
     Per hop: resolve → validate every address against the public-IP policy →
@@ -567,8 +583,8 @@ async def _http_fetch(url: str, *, headers: dict[str, str] | None = None) -> Fet
                     body = b""
                     async for chunk in resp.aiter_bytes():
                         body += chunk
-                        if len(body) > MAX_BODY_BYTES:
-                            raise UnsafeURL(f"response body exceeds {MAX_BODY_BYTES} bytes")
+                        if len(body) > max_bytes:
+                            raise UnsafeURL(f"response body exceeds {max_bytes} bytes")
                     return FetchOutcome(
                         status=resp.status_code,
                         headers={k.lower(): v for k, v in resp.headers.items()},
@@ -1818,3 +1834,97 @@ async def open_in_preview(payload: dict[str, Any] = Body(...)) -> dict[str, Any]
         "preview.open", {"url": url, "label": label or url}
     )
     return {"opened": url}
+
+
+# ---------------------------------------------------------------------------
+# Favicon proxy (issue: renderer <img> fetches bypass the pinned transport)
+# ---------------------------------------------------------------------------
+
+_ICON_CACHE: dict[str, tuple[float, str | None]] = {}
+_ICON_CACHE_LOCK = asyncio.Lock()
+# Bound the cache: keys come from the `url` query param (attacker-influenced —
+# a malicious feed can rotate unique icon URLs with query nonces), so an
+# unbounded map is a slow memory-leak handle. Simple FIFO cap; TTL still
+# governs freshness.
+_ICON_CACHE_MAX_ENTRIES = 512
+
+
+def _icon_cache_key(url: str) -> str:
+    """Collapse query-noise variants of the same icon to one cache entry."""
+    parts = urlsplit(url)
+    if not parts.query:
+        return url
+    keep = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+            if k.lower() not in ("utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term")]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                       urlencode(keep), parts.fragment))
+
+
+@router.get("/icon.json")
+async def get_icon(url: str = Query(...)) -> dict[str, Any]:
+    """Fetch a remote icon through the SSRF gate + pinned transport and return
+    it as a ``data:`` URL.
+
+    Why this exists: favicon URLs are attacker-controlled network input too,
+    but the renderer loads them with plain ``<img src>`` — a second, unpinned
+    DNS resolution outside the validated transport (independently reported as
+    issue #6). The SDK's ``rest`` door is JSON-only, so the bytes ride back
+    base64-encoded instead of raw.
+
+    Policy: URL validated by ``_assert_public_http_url`` (which the fetch
+    re-validates per hop, pinned to the validated address set), image
+    content-type allowlist, 64 KB body cap, and a bounded 24 h TTL cache
+    (keys normalized + capped: the URL is attacker-influenced) so the
+    marquee's repeated rows do not refetch per render. Failures return
+    ``{"data_url": null}`` — the renderer already hides broken images.
+    """
+    cache_key = _icon_cache_key(url)
+    async with _ICON_CACHE_LOCK:
+        cached = _ICON_CACHE.get(cache_key)
+        if cached and cached[0] > time.time():
+            return {"url": url, "data_url": cached[1]}
+
+    try:
+        await _assert_public_http_url_sync(url)
+    except UnsafeURL as exc:
+        raise _err(400, "unsafe_url", str(exc)) from exc
+
+    fetch_error: str | None = None
+    try:
+        out = await _http_fetch(url, max_bytes=ICON_MAX_BODY_BYTES)
+    except UnsafeURL as exc:
+        raise _err(400, "unsafe_url", str(exc)) from exc
+    except Exception as exc:
+        out = None
+        # Never raise for a broken icon — but do not swallow the reason either:
+        # a silent null here is indistinguishable from a dead source.
+        fetch_error = f"{type(exc).__name__}: {exc}"[:200]
+        logger.warning("icon proxy fetch failed for %s: %s", url, fetch_error)
+
+
+    ctype = (out.headers.get("content-type", "") if out else "").split(";")[0].strip().lower()
+    data_url: str | None = None
+    if (
+        out is not None
+        and out.status == 200
+        and ctype in ICON_ALLOWED_CONTENT_TYPES
+        and out.body
+        and len(out.body) <= ICON_MAX_BODY_BYTES
+    ):
+        data_url = f"data:{ctype};base64,{base64.b64encode(out.body).decode('ascii')}"
+
+    # Negative results cache 10× shorter: a transient icon-host blip or a
+    # briefly-down backend shouldn't hide an icon for a full day.
+    ttl = ICON_NEGATIVE_TTL_SECONDS if data_url is None else ICON_CACHE_TTL_SECONDS
+    async with _ICON_CACHE_LOCK:
+        if len(_ICON_CACHE) >= _ICON_CACHE_MAX_ENTRIES and cache_key not in _ICON_CACHE:
+            # Evict the entries expiring soonest (≈oldest first: positive
+            # entries share one TTL, negatives a shorter one) — keeps the map
+            # bounded under unique-URL rotation without per-entry bookkeeping.
+            for old_key in sorted(_ICON_CACHE, key=lambda k: _ICON_CACHE[k][0])[: max(1, _ICON_CACHE_MAX_ENTRIES // 3)]:
+                _ICON_CACHE.pop(old_key, None)
+        _ICON_CACHE[cache_key] = (time.time() + ttl, data_url)
+    resp: dict[str, Any] = {"url": url, "data_url": data_url}
+    if fetch_error:
+        resp["error"] = fetch_error
+    return resp

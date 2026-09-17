@@ -1,3 +1,10 @@
 __pycache__/
 .pytest_cache/
 *.pyc
+
+# graphify local knowledge-graph output (derived, machine-specific)
+graphify-out/
+
+# interaction-test harness artifacts (generated)
+tests/ui/.stubs-interaction/
+tests/ui/interaction-loader.mjs

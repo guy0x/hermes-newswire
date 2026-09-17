@@ -36,6 +36,38 @@ git clone https://github.com/tony-simons-aiowa/hermes-newswire ~/.hermes/plugins
 
 Verify: `Mounted plugin API routes: /api/plugins/hermes-newswire/` in `~/.hermes/logs/agent.log`.
 
+### Install & security scan (FAQ)
+
+`hermes plugins install` runs a security scan. This plugin installs with a
+**caution** verdict: the scan deliberately inspects test files (hostile
+fixtures prove the SSRF gate rejects `file://` and loopback URLs — see
+`tests/test_engine.py`, `tests/test_http.py`) and README install commands
+(`git clone`, `~/.hermes/config.yaml`). None of it is runtime behavior.
+
+- **CLI:** the installer prints the findings and asks `Install anyway?
+  [y/N]` — answer `y` (or run `hermes plugins install <repo> --force`).
+  `dangerous` verdicts are never installable; caution is a confirm gate.
+- **Desktop/dashboard Plugins page:** the GUI has **no review prompt** —
+  the install endpoint accepts no decision callback, so a caution verdict
+  is refused outright with the full findings list. Use the CLI for the
+  interactive confirm (upstream gap; see TROUBLESHOOTING).
+
+## Troubleshooting
+
+**"Settings does nothing" / "clicking a starter feed does nothing"**
+The page needs the plugin backend. Checks, in order:
+1. Is the plugin in `plugins.enabled` in `~/.hermes/config.yaml`?
+2. Did the serve child restart *after* install? (`hermes gateway restart`,
+   or restart Hermes Desktop). The ticker can render from cache while the
+   management API 404s.
+3. Open Settings or Sources: a red banner now names the exact failure and
+   the fix. Starter-feed clicks surface the backend's error inline
+   (e.g. `VentureBeat AI could not be added: HTTP 429 fetching …` — some
+   publishers bot-block the first fetch; try again or use Discover).
+
+**Installing reports `Security scan blocked plugin install`** — see the
+install FAQ above; confirm through the CLI prompt.
+
 ## Layout
 
 ```
@@ -54,6 +86,14 @@ RSS 2.0, RSS 1.0/RDF, Atom, JSON Feed. Discovery: `<link rel="alternate">` tags 
 
 Source URLs are untrusted: http/https only (no file/ftp), loopback/private/link-local/CGNAT/metadata addresses blocked (literal, hex/octal legacy forms, AND post-DNS resolution), redirects validated per hop (max 3), 5s connect / 15s total timeouts, 5 MB body cap, all feed HTML stripped before storage. OPML import validates every URL through the same gates. No telemetry, no remote service, no secrets.
 
+**Favicons are proxied** (`GET /icon.json?url=…`): the backend fetches icons
+through the same SSRF gate + validated-IP pinning as feeds and returns a
+base64 data URL (image content-type allowlist, 64 KB cap, 24 h TTL cache,
+failures return `data_url: null` plus an `error` reason — never raw bytes).
+The renderer's `<img>` tags therefore never resolve attacker-controlled
+hostnames directly; the desktop SDK exposes no raw-byte door a plugin could
+use to fetch binaries itself (upstream seam gap worth closing generically).
+
 ## Settings
 
 Ticker enabled · scroll speed · **text size 9–20px** (strip height follows) · pause on hover · show source · relative time · only-unread · max article age · max headlines · refresh interval (30s–24h, default 5min). Conditional GETs (ETag/Last-Modified → 304) keep polling cheap.
@@ -63,6 +103,8 @@ Ticker enabled · scroll speed · **text size 9–20px** (strip height follows) 
 ```bash
 env -u PYTHONPATH ~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ -q
 node --check desktop/plugin.js
+node tests/ui/esm-render.mjs        # stateless render smoke (26 checks)
+node tests/ui/interaction.mjs       # stateful interaction tests (29 checks)
 ```
 
 ## Agent-friendly development
