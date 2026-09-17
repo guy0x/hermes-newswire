@@ -1840,6 +1840,22 @@ async def open_in_preview(payload: dict[str, Any] = Body(...)) -> dict[str, Any]
 
 _ICON_CACHE: dict[str, tuple[float, str | None]] = {}
 _ICON_CACHE_LOCK = asyncio.Lock()
+# Bound the cache: keys come from the `url` query param (attacker-influenced —
+# a malicious feed can rotate unique icon URLs with query nonces), so an
+# unbounded map is a slow memory-leak handle. Simple FIFO cap; TTL still
+# governs freshness.
+_ICON_CACHE_MAX_ENTRIES = 512
+
+
+def _icon_cache_key(url: str) -> str:
+    """Collapse query-noise variants of the same icon to one cache entry."""
+    parts = urlsplit(url)
+    if not parts.query:
+        return url
+    keep = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+            if k.lower() not in ("utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term")]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                       urlencode(keep), parts.fragment))
 
 
 @router.get("/icon.json")
@@ -1855,12 +1871,14 @@ async def get_icon(url: str = Query(...)) -> dict[str, Any]:
 
     Policy: URL validated by ``_assert_public_http_url`` (which the fetch
     re-validates per hop, pinned to the validated address set), image
-    content-type allowlist, 64 KB body cap, and a 24 h in-process TTL cache so
-    the marquee's repeated rows do not refetch per render. Failures return
+    content-type allowlist, 64 KB body cap, and a bounded 24 h TTL cache
+    (keys normalized + capped: the URL is attacker-influenced) so the
+    marquee's repeated rows do not refetch per render. Failures return
     ``{"data_url": null}`` — the renderer already hides broken images.
     """
+    cache_key = _icon_cache_key(url)
     async with _ICON_CACHE_LOCK:
-        cached = _ICON_CACHE.get(url)
+        cached = _ICON_CACHE.get(cache_key)
         if cached and cached[0] > time.time():
             return {"url": url, "data_url": cached[1]}
 
@@ -1893,7 +1911,12 @@ async def get_icon(url: str = Query(...)) -> dict[str, Any]:
         data_url = f"data:{ctype};base64,{base64.b64encode(out.body).decode('ascii')}"
 
     async with _ICON_CACHE_LOCK:
-        _ICON_CACHE[url] = (time.time() + ICON_CACHE_TTL_SECONDS, data_url)
+        if len(_ICON_CACHE) >= _ICON_CACHE_MAX_ENTRIES and cache_key not in _ICON_CACHE:
+            # FIFO eviction of the oldest third — keeps the map bounded under
+            # unique-URL rotation without per-entry bookkeeping.
+            for old_key in sorted(_ICON_CACHE, key=lambda k: _ICON_CACHE[k][0])[: max(1, _ICON_CACHE_MAX_ENTRIES // 3)]:
+                _ICON_CACHE.pop(old_key, None)
+        _ICON_CACHE[cache_key] = (time.time() + ICON_CACHE_TTL_SECONDS, data_url)
     resp: dict[str, Any] = {"url": url, "data_url": data_url}
     if fetch_error:
         resp["error"] = fetch_error

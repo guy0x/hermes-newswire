@@ -349,18 +349,30 @@ function useSources() {
 // Ticker (statusbar)
 // ─────────────────────────────────────────────────────────────────────────
 
-// Favicon <img> sources go through the backend's SSRF-gated, pinned-transport
-// icon proxy (/icon.json → data: URL). A direct https favicon URL would be a
-// second, unpinned DNS resolution in the renderer — outside every gate the
-// backend enforces (issue #6). Proxy failures return data_url:null → render
-// the fallback dot.
-function iconProxySrc(u) {
-  if (!u || typeof u !== 'string') return ''
-  return `/icon.json?url=${encodeURIComponent(u)}`
+// Favicon <img> sources go through the backend's SSRF-gated icon proxy
+// (issue #6). rest() is the only renderer door (namespace-scoped, JSON-only),
+// so fetch the data: URL and use THAT as the src — a root-relative path
+// would resolve against the app origin (not the backend namespace), and the
+// endpoint returns JSON, neither of which an <img> can load. Null → caller
+// renders the fallback dot.
+function useIconDataUrl(u) {
+  const q = useQuery({
+    queryKey: [ID, 'icon', u],
+    queryFn: async () => {
+      if (!u || typeof u !== 'string') return null
+      const out = await rest(`/icon.json?url=${encodeURIComponent(u)}`)
+      return (out && out.data_url) || null
+    },
+    enabled: !!u,
+    staleTime: 24 * 3600_000, // mirrors backend ICON_CACHE_TTL_SECONDS
+    retry: 0
+  })
+  return u ? (q.data || null) : null
 }
 
 function TickerItem({ a, settings }) {
   const age = settings?.relative_time !== false ? relTime(a.published_at) : ''
+  const iconSrc = useIconDataUrl(a.favicon_url)
   return jsx('button', {
     className: `${ID}-item`,
     'data-read': a.read ? '1' : '0',
@@ -374,8 +386,8 @@ function TickerItem({ a, settings }) {
     children: jsxs('span', {
       style: { display: 'inline-flex', alignItems: 'center', gap: '0.375rem' },
       children: [
-        a.favicon_url
-          ? jsx('img', { src: iconProxySrc(a.favicon_url), className: `${ID}-favicon`, alt: '',
+        iconSrc
+          ? jsx('img', { src: iconSrc, className: `${ID}-favicon`, alt: '',
               onError: e => { e.currentTarget.style.display = 'none' } })
           : jsx('span', { className: `${ID}-dot`, children: '◆' }),
         settings?.show_source !== false ? jsx('span', { className: `${ID}-src`, children: `${a.source_name}:` }) : null,
@@ -570,6 +582,7 @@ function NewswireTicker() {
 // ─────────────────────────────────────────────────────────────────────────
 
 function ArticleRow({ a }) {
+  const iconSrc = useIconDataUrl(a.favicon_url)
   return jsxs('div', { className: `${ID}-row`, 'data-read': a.read ? '1' : '0', children: [
     jsx('div', {
       className: `${ID}-rowmain`,
@@ -583,7 +596,7 @@ function ArticleRow({ a }) {
         }),
         a.summary ? jsx('div', { className: `${ID}-rowsum`, children: a.summary }) : null,
         jsxs('div', { className: `${ID}-meta`, children: [
-          a.favicon_url ? jsx('img', { src: iconProxySrc(a.favicon_url), className: `${ID}-favicon`, alt: '',
+          iconSrc ? jsx('img', { src: iconSrc, className: `${ID}-favicon`, alt: '',
             onError: e => { e.currentTarget.style.display = 'none' } }) : null,
           jsx('span', { children: a.source_name }),
           a.read ? jsx('span', { children: '· read' }) : null,
@@ -1074,13 +1087,16 @@ function SourcesTab({ sources, onChanged, autofocusAdd }) {
 
 function SettingsTab() {
   const [settingsQ, s] = useSettings()
+  // Save-error state must be declared BEFORE the error early return below:
+  // hook order is invariant across renders (a return between hooks makes the
+  // hook count depend on settingsQ.isError — React "rendered fewer hooks").
+  const [saveError, setSaveError] = useState('')
   if (settingsQ?.isError) return jsx('div', { className: `${ID}-page`, children:
     jsx('div', { className: `${ID}-scrollwrap`, children:
       jsx(QueryErrorBanner, { q: settingsQ, label: 'settings' })
     })
   })
   openArticleMode = s?.open_article_behavior === 'external' ? 'external' : 'internal'
-  const [saveError, setSaveError] = useState('')
   const save = useMutation({
     mutationFn: patch => rest('/settings', { method: 'PATCH', body: patch }),
     onSuccess: (_data, patch) => {

@@ -56,6 +56,11 @@ const useEffect = () => {}
 const useMemo = fn => (typeof fn === 'function' ? fn() : fn)
 const useRef = v => ({ current: v })
 
+// Terminal-element unwrapping shared by invokeComponent + normalizeOut.
+function unwrapTerm(out) {
+  return (out && typeof out === 'object' && out.el !== undefined && !out.props) ? out.el : out
+}
+
 // Invoke a component with a fresh hook frame. Returns a NORMALIZED node:
 // type/props describe the RETURNED element (for tree walking); __callProps
 // keeps the invocation props so deepRerender can re-invoke faithfully.
@@ -64,8 +69,7 @@ const invokeComponent = (type, props) => {
   const prev = globalThis.__nwCurrentFrame
   globalThis.__nwCurrentFrame = frame
   try {
-    const out = type(props || {})
-    const term = (out && typeof out === 'object' && out.el !== undefined && !out.props) ? out.el : out
+    const term = unwrapTerm(type(props || {}))
     return {
       __frame: frame,
       __origType: type,
@@ -88,16 +92,21 @@ const invokeComponent = (type, props) => {
 // without this, state written by handlers (pending flags, inline errors)
 // would be discarded on every re-render.
 function normalizeOut(out) {
-  const term = (out && typeof out === 'object' && out.el !== undefined && !out.props) ? out.el : out
+  const term = unwrapTerm(out)
   return {
     type: term && term.type,
     props: (term && term.props) || {},
     renderError: term ? term.renderError : undefined
   }
 }
+function asArray(v) {
+  if (Array.isArray(v)) return v
+  if (v && typeof v === 'object') return [v]
+  return []
+}
 function reconcileKids(kids, oldKids) {
-  const o = Array.isArray(oldKids) ? oldKids : (oldKids && typeof oldKids === 'object' ? [oldKids] : [])
-  const n = Array.isArray(kids) ? kids : (kids && typeof kids === 'object' ? [kids] : [])
+  const o = asArray(oldKids)
+  const n = asArray(kids)
   for (let i = 0; i < n.length; i++) {
     if (n[i] && typeof n[i] === 'object') adopt(n[i], o[i])
   }
@@ -156,7 +165,6 @@ const restLog = []
 let restBehavior = () => ({ body: {} })
 const scriptRest = fn => { restBehavior = fn }
 const setQuery = (key, data) => { Q[key] = { data } }
-const failQuery = (key, err) => { Q[key] = { error: err } }
 const clearQueries = () => { for (const k of Object.keys(Q)) delete Q[k] }
 
 const SETTINGS = {
@@ -168,6 +176,27 @@ const SETTINGS = {
 
 function useQuery(options) {
   const key = options && Array.isArray(options.queryKey) ? options.queryKey.join('|') : ''
+  // Icon queries run through the harness's scripted rest() door. Memoize by
+  // key (React Query caches across renders; a bare promise would re-fetch and
+  // never resolve before the synchronous return).
+  if (key.includes('|icon')) {
+    const cache = (globalThis.__nwIconCache = globalThis.__nwIconCache || {})
+    let st = cache[key]
+    if (!st) {
+      st = cache[key] = { data: undefined, error: null }
+      void Promise.resolve()
+        .then(() => options.queryFn())
+        .then(d => { st.data = d })
+        .catch(e => { st.error = e })
+    }
+    return {
+      get data() { return st.data },
+      get error() { return st.error },
+      get isLoading() { return st.data === undefined && !st.error },
+      get isError() { return !!st.error },
+      refetch: async () => {}
+    }
+  }
   const q = globalThis.__nwQueries || {}
   let st = { data: undefined, error: null }
   if (key.includes('|settings') && q['hermes-newswire|settings']) st = q['hermes-newswire|settings']
@@ -224,6 +253,7 @@ const sdkPlain = {
 }
 
 const sdkStubSource = [
+  `const unwrapTerm = ${unwrapTerm.toString()}`,
   `const __atom = ${atom.toString()}`,
   `const __useValue = ${useValue.toString()}`,
   `const __useMutation = ${useMutation.toString()}`,
@@ -252,11 +282,11 @@ function serializeHost(h) {
   for (const [k, v] of Object.entries(h)) {
     if (typeof v === 'function') lines.push(`  ${k}: ${v.toString()}`)
     else if (v && typeof v === 'object' && k === 'state') {
-      const stateLines = Object.entries(v).map(([sk, sv]) =>
-        typeof sv === 'function' ? `    ${sk}: ${sv.toString()}` :
-        (sv && typeof sv.get === 'function') ? `    ${sk}: { get: ${sv.get.toString()} }` :
-        `    ${sk}: ${JSON.stringify(sv)}`
-      ).join(',\n')
+      const stateLines = Object.entries(v).map(([sk, sv]) => {
+        if (typeof sv === 'function') return `    ${sk}: ${sv.toString()}`
+        if (sv && typeof sv.get === 'function') return `    ${sk}: { get: ${sv.get.toString()} }`
+        return `    ${sk}: ${JSON.stringify(sv)}`
+      }).join(',\n')
       lines.push(`  state: {\n${stateLines}\n  }`)
     } else if (v && typeof v === 'object') lines.push(`  ${k}: ${JSON.stringify(v)}`)
     else lines.push(`  ${k}: ${JSON.stringify(v)}`)
@@ -275,6 +305,7 @@ writeFileSync(join(STUBS_DIR, 'react.mjs'), [
   'export default { useState, useEffect, useMemo, useRef }'
 ].join('\n'))
 writeFileSync(join(STUBS_DIR, 'jsx-runtime.mjs'), [
+  `const unwrapTerm = ${unwrapTerm.toString()}`,
   `const __invoke = ${invokeComponent.toString()}`,
   `const __jsx = (type, props) => {
     if (typeof type === 'function') return __invoke(type, props)
@@ -385,6 +416,13 @@ Q['hermes-newswire|ticker'] = { data: [] }
 
 let pageNode = pageCont.render()
 await flush()
+if (process.env.__NW_DEBUG) {
+  console.log('DEBUG pageNode:', JSON.stringify(pageNode, (k, v) => {
+    if (typeof v === 'function') return 'ƒ:' + (v.name || 'anon')
+    if (v instanceof Error) return 'ERR:' + v.message
+    return v
+  }).slice(0, 800))
+}
 
 // ---------------------------------------------------------------------------
 // 1) Tab navigation: Latest -> Settings opens and renders
@@ -394,6 +432,10 @@ let tabs = findButtons(pageNode, n => n.props.role === 'tab')
 check(tabs.length === 3, 'page shows three tabs, got ' + tabs.length)
 const settingsTab = tabs.find(t => directText(t).includes('Settings'))
 check(!!settingsTab, 'Settings tab exists')
+if (!settingsTab) {
+  console.log(`FAILURES: ${failures} of ${checks}`)
+  process.exit(1)
+}
 settingsTab.props.onClick()
 await flush()
 deepRerender(pageNode) // in-place re-render: tab state persists in the frame
@@ -458,10 +500,12 @@ let chips = findButtons(pageNode, n => directText(n).startsWith('+ '))
 check(chips.length >= 6, 'starter feed chips render, got ' + chips.length)
 const vb = chips.find(c => directText(c).includes('VentureBeat AI'))
 check(!!vb, 'VentureBeat AI starter chip exists')
-check(vb.props['data-pending'] === '0' && vb.props.disabled === false, 'chip is enabled before click')
-vb.props.onClick()
-await flush()
-deepRerender(pageNode)
+if (vb) {
+  check(vb.props['data-pending'] === '0' && vb.props.disabled === false, 'chip is enabled before click')
+  vb.props.onClick()
+  await flush()
+  deepRerender(pageNode)
+}
 const addCall = restLog.find(c => c.path === '/sources' && c.opts && c.opts.method === 'POST')
 check(!!addCall, 'starter click POSTs /sources')
 check(addCall && addCall.opts.body.feed_url === 'https://venturebeat.com/category/ai/feed/', 'POST body carries the VentureBeat AI feed URL')
@@ -522,9 +566,12 @@ await flush()
 deepRerender(pageNode)
 const hnChip = findButtons(pageNode, n => directText(n).startsWith('+ '))
   .find(c => directText(c).includes('Hacker News'))
-hnChip.props.onClick()
-await flush()
-deepRerender(pageNode)
+check(!!hnChip, 'Hacker News starter chip exists')
+if (hnChip) {
+  hnChip.props.onClick()
+  await flush()
+  deepRerender(pageNode)
+}
 let pendingChips = findButtons(pageNode, n => directText(n).startsWith('+ '))
   .filter(c => c.props['data-pending'] === '1' || c.props.disabled === true)
 check(pendingChips.length === 1, 'clicked chip shows pending state while in flight')
@@ -549,10 +596,14 @@ scriptRest(({ path, opts }) => {
 pageNode = pageCont.render()
 await flush()
 deepRerender(pageNode)
-findButtons(pageNode, n => directText(n).startsWith('+ '))
-  .find(c => directText(c).includes('Hacker News')).props.onClick()
-await flush()
-deepRerender(pageNode)
+const dupChip = findButtons(pageNode, n => directText(n).startsWith('+ '))
+  .find(c => directText(c).includes('Hacker News'))
+check(!!dupChip, 'Hacker News chip exists for duplicate test')
+if (dupChip) {
+  dupChip.props.onClick()
+  await flush()
+  deepRerender(pageNode)
+}
 check(textOf(pageNode).includes('Hacker News is already in your sources'), 'duplicate add gets a friendly message')
 
 // ---------------------------------------------------------------------------
@@ -586,13 +637,27 @@ setQuery('hermes-newswire|settings', SETTINGS)
 Q['hermes-newswire|ticker'] = { data: [
   { id: 1, source_id: 1, title: 'Headline', source_name: 'Feed A', canonical_url: 'https://a.example/1', published_at: new Date().toISOString(), read: false, favicon_url: 'https://icons.example/favicon.ico' }
 ] }
+// The renderer fetches the data: URL through rest('/icon.json?url=…') — the
+// SDK's namespace-scoped JSON door — and uses the returned data_url as src.
+const ICON_URL = 'https://icons.example/favicon.ico'
+const ICON_DATA_URL = 'data:image/x-icon;base64,AAABAAEAA'
+scriptRest(({ path }) => {
+  if (path.startsWith('/icon.json?url=')) {
+    return { body: { url: decodeURIComponent(path.split('url=')[1]), data_url: ICON_DATA_URL } }
+  }
+  return { body: {} }
+})
 let tickerNode = tickerCont.render()
-await flush()
-deepRerender(tickerNode)
+for (let i = 0; i < 6; i++) {
+  await flush()
+  tickerNode = tickerCont.render() // fresh frames each render; queryFn memoized by real React cache in prod
+}
 const imgs = findAll(tickerNode, n => n.type === 'img' && n.props && n.props.src)
-check(imgs.length >= 1, 'ticker renders favicon img')
-check(imgs[0] && imgs[0].props.src === '/icon.json?url=' + encodeURIComponent('https://icons.example/favicon.ico'),
-  'favicon src routes through the SSRF-gated /icon.json proxy, got ' + (imgs[0] && imgs[0].props.src))
+check(imgs.length >= 1, 'ticker renders favicon img from proxied data URL')
+check(imgs[0] && imgs[0].props.src === ICON_DATA_URL,
+  'favicon src is the data: URL fetched via rest(/icon.json), got ' + (imgs[0] && String(imgs[0].props.src).slice(0, 40)))
+const iconCall = restLog.find(c => c.path.startsWith('/icon.json?url='))
+check(!!iconCall && iconCall.path.includes(encodeURIComponent(ICON_URL)), 'renderer requested the icon through the backend proxy door')
 
 // ---------------------------------------------------------------------------
 console.log(
