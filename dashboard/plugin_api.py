@@ -11,8 +11,9 @@ Design (M2 backend, Kanban t_e0c80073):
 * Feed parsing ported from the proven stdlib parser in the ``rss-feeds`` skill
   (``research/rss-feeds/scripts/feed.py``): RSS 2.0 / RSS 1.0 RDF / Atom /
   JSON Feed, plus HTML discovery via ``<link rel=alternate>`` and common paths.
-* SQLite storage under ``<HERMES_HOME>/state/newswire/newswire.db`` (WAL),
-  home resolved via ``hermes_constants.get_hermes_home()`` at call time.
+* SQLite storage under ``<SHARED_HOME>/state/newswire/newswire.db`` (WAL),
+  where SHARED_HOME is the DEFAULT/shared Hermes home (``get_default_hermes_root()``)
+  — the fleet board's store is shared across profiles, not profile-local.
 * All fetches go through one seam — ``_http_fetch`` — which enforces the SSRF
   policy (http/https only, DNS-resolved IP allow-listing per hop, redirect
   target validation BEFORE following, ≤3 redirects, 5s connect / 15s total,
@@ -79,12 +80,37 @@ from fastapi import APIRouter, Body, HTTPException, Query
 from fastapi.responses import Response
 
 try:  # available in-gateway; tests get it via the hermes-agent venv
-    from hermes_constants import get_hermes_home
+    from hermes_constants import get_hermes_home, get_default_hermes_root
 except Exception:  # pragma: no cover - defensive fallback
     import os
 
     def get_hermes_home() -> Path:  # type: ignore[misc]
         return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+
+    def get_default_hermes_root() -> Path:  # type: ignore[misc]
+        env = os.environ.get("HERMES_HOME", "").strip()
+        native = Path.home() / ".hermes"
+        if not env:
+            return native
+        env_path = Path(env)
+        try:
+            env_path.resolve().relative_to(native.resolve())
+            return native
+        except ValueError:
+            return env_path.parent.parent if env_path.parent.name == "profiles" else env_path
+
+
+def _shared_home() -> Path:
+    """The DEFAULT/shared Hermes home that owns ``state/``, ``kanban.db`` and ``profiles/``.
+
+    ``get_hermes_home()`` is profile-aware: Hermes exports ``HERMES_HOME=<root>/profiles/<p>``
+    for agent/cron sessions, so it would point every fleet-wide path into an empty profile-local
+    store. The newswire DB, the HL signal cache, the fleet cron dirs, the gateway heartbeat and
+    the fleet kanban board are SHARED fleet state, not per-profile. ``get_default_hermes_root()``
+    (hermes_constants) collapses ``<root>/profiles/<p>`` back to ``<root>`` and keeps the default
+    home as itself, so the default home and every profile land on the same shared store.
+    """
+    return Path(get_default_hermes_root())
 
 PLUGIN_VERSION = "0.1.0"
 USER_AGENT = f"hermes-newswire/{PLUGIN_VERSION} (+https://github.com/NousResearch/hermes-agent)"
@@ -708,7 +734,7 @@ def _now_iso() -> str:
 
 
 def _db_path() -> Path:
-    return get_hermes_home() / "state" / "newswire" / "newswire.db"
+    return _shared_home() / "state" / "newswire" / "newswire.db"
 
 
 def _connect() -> sqlite3.Connection:
@@ -2218,7 +2244,7 @@ async def _hl_fetch(conn: sqlite3.Connection) -> dict[str, Any]:
         # Conviction overlay from the position monitor's entry-signal cache.
         conviction: dict[str, int] = {}
         try:
-            ep = Path(get_hermes_home()) / "hl_state" / "entry_signals.json"
+            ep = _shared_home() / "hl_state" / "entry_signals.json"
             if ep.exists():
                 sig = json.loads(ep.read_text("utf-8"))
                 if isinstance(sig, dict):
@@ -2352,7 +2378,7 @@ def _cron_failures(hours: int = 24) -> dict[str, Any]:
 
 
 def _heartbeat_age() -> dict[str, Any]:
-    p = Path(get_hermes_home()) / "state" / "gateway.heartbeat"
+    p = _shared_home() / "state" / "gateway.heartbeat"
     try:
         data = json.loads(p.read_text("utf-8"))
         dt = _parse_ts(data.get("updated_at"))
@@ -2379,7 +2405,7 @@ def _ticker_age() -> dict[str, Any]:
 
 
 def _kanban_churn() -> dict[str, Any]:
-    p = Path(get_hermes_home()) / "kanban.db"
+    p = _shared_home() / "kanban.db"
     if not p.exists():
         return {"counts": {}, "latest": None}
     try:
