@@ -1,21 +1,22 @@
 """Shared-state invariance across profiles (profile-scoping bug).
 
 Hermes agent/cron sessions export ``HERMES_HOME=<root>/profiles/<p>`` (profile-aware), but
-the newswire DB and the fleet cron-root are SHARED fleet state living under the DEFAULT home
-(``<root>/state/newswire/newswire.db`` and ``<root>/cron`` + ``<root>/profiles/*/cron``),
-not per-profile stores. The plugin's fleet paths must therefore resolve through the shared
-home resolver (``hermes_constants.get_default_hermes_root()`` / ``_shared_home``) so the
-board keeps reading/writing the SAME store no matter which profile is active.
+the newswire DB is SHARED fleet state living under the DEFAULT home
+(``<root>/state/newswire/newswire.db``), not a per-profile store. The plugin's fleet paths
+must therefore resolve through the shared home resolver
+(``hermes_constants.get_default_hermes_root()`` / ``_shared_home``) so the board keeps
+reading/writing the SAME store no matter which profile is active.
 
 Contract under test: running the plugin with ``HERMES_HOME=<default home>`` and with
-``HERMES_HOME=<default home>/profiles/<p>`` resolves the SAME newswire DB path and the SAME
-cron-dir root — two homes A -> B -> A collapse to one shared path. This is an
-invariant/relationship assertion, deliberately NOT a literal-path frozen change-detector.
+``HERMES_HOME=<default home>/profiles/<p>`` resolves the SAME newswire DB path — two homes
+A -> B -> A collapse to one shared path. This is an invariant/relationship assertion,
+deliberately NOT a literal-path frozen change-detector.
+
+(The fleet cron-dir enumeration this test also covered was removed together with the
+agent-health lane on 2026-09-20; the DB invariance IS the profile-switch fix.)
 """
 
 from __future__ import annotations
-
-from pathlib import Path
 
 import pytest
 
@@ -41,12 +42,3 @@ def test_shared_state_is_profile_invariant(monkeypatch, tmp_path, profile):
     # And it must sit under <shared>/state/newswire/newswire.db.
     assert mod_profile._db_path().parent.name == "newswire"
     assert mod_profile._db_path().parent.parent.name == "state"
-
-    # The two homes enumerate the SAME cron-dir root (shared fleet cron), never an empty set.
-    cron_default = mod_default._profile_cron_dirs()
-    cron_profile = mod_profile._profile_cron_dirs()
-    assert cron_default == cron_profile
-    assert cron_profile, "active profile must never blank the shared cron surface"
-    # One of the enumerated dirs is <shared>/cron (the shared root, not the profile root).
-    shared_root = mod_profile._shared_home()
-    assert Path(str(shared_root)) / "cron" in cron_profile

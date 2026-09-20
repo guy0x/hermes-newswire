@@ -75,7 +75,6 @@ let addFocusArmed = false
 const $lastItem = atom(null)    // last focused ticker/page item (any lane)
 const $pinTab = atom(null)      // pin-chip click → page tab to surface
 const __seenWatch = new Set()   // watch-article ids already notified (cap 250)
-let __notifiedCrit = {}         // agent signal id -> crit-notified until ok
 
 // ─────────────────────────────────────────────────────────────────────────
 // Constants
@@ -191,12 +190,8 @@ function ensureStyles() {
        page-row titles) gets a visible focus ring built from theme vars. */
     `.${ID}-page button:focus-visible, .${ID}-ticker button:focus-visible { outline: 1px solid var(--ui-accent); outline-offset: -1px; }`,
     `.${ID}-page select:focus-visible { outline: 1px solid var(--ui-accent); outline-offset: 1px; }`,
-    /* Signal lanes (news · trades · agent) + health rail + pins */
-    `.${ID}-rail { display: inline-flex; align-items: center; gap: 0.25rem; flex: none; height: 100%; padding: 0 0.25rem 0 0.5rem; }`,
-    `.${ID}-dotbtn { width: 0.5rem; height: 0.5rem; border-radius: 999px; border: 0; padding: 0; cursor: pointer; display: inline-block; flex: none; box-shadow: 0 0 0 1px var(--ui-bg-sidebar, var(--ui-bg-secondary)); }`,
+    /* Signal lanes (news · trades) + watch chips */
     `.${ID}-dotbtn:hover { transform: scale(1.45); }`,
-    `.${ID}-pins { display: inline-flex; align-items: center; gap: 0.25rem; flex: none; height: 100%; padding: 0 0.5rem; background: none; border: 0; font-size: 0.6875rem; font-weight: 700; color: var(--ui-red, #e5484d); cursor: pointer; font-family: inherit; }`,
-    `.${ID}-pins:hover { background: var(--chrome-action-hover); }`,
     `.${ID}-watch { color: var(--ui-accent); font-weight: 700; }`
   ].join('\n')
   let style = document.getElementById(`${ID}-styles`)
@@ -287,15 +282,12 @@ async function openArticle(url, articleId) {
 // "Ask Hermes about this" — official SDK path: host.request is the gateway
 // JSON-RPC door (same one the app itself uses) and prompt.submit is the
 // documented submit method. Sends into the FOCUSED chat session. The item
-// shape is lane-aware: articles summarize, trades ask about the position,
-// agent events ask what to do.
+// shape is lane-aware: articles summarize, trades ask about the position.
 async function askHermes(it) {
   if (!it) return
   let prompt
   if (it.kind === 'trade') {
     prompt = `My Hyperliquid lane shows: ${it.title}${it.detail ? ` (${it.detail})` : ''}. Explain what this means and whether my position is at risk.`
-  } else if (it.kind === 'agent') {
-    prompt = `My Hermes agent reports: ${it.title}${it.detail ? ` (${it.detail})` : ''}. What should I do about it?`
   } else {
     prompt = `Summarize this article and tell me why it matters:\n\n${it.title || '(untitled)'}\n${it.url || it.canonical_url || ''}`
   }
@@ -377,16 +369,6 @@ function useTrades() {
   })
 }
 
-function useAgentHealth() {
-  return useQuery({
-    queryKey: [ID, 'agent'],
-    queryFn: async () => ((await rest('/agent/health')) || { signals: [], pins: [] }),
-    refetchInterval: 45_000,
-    staleTime: 40_000,
-    retry: 1
-  })
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // Ticker (statusbar)
 // ─────────────────────────────────────────────────────────────────────────
@@ -417,7 +399,7 @@ function useIconDataUrl(u) {
 
 function TickerItem({ it, settings }) {
   const age = it.published_at && settings?.relative_time !== false ? relTime(it.published_at) : (it.age || '')
-  const isArticle = it.kind !== 'trade' && it.kind !== 'agent'
+  const isArticle = it.kind !== 'trade'
   const iconSrc = useIconDataUrl(it.favicon_url)
   return jsx('button', {
     className: `${ID}-item`,
@@ -526,8 +508,8 @@ function TickerRefresh() {
   })
 }
 
-// Build the flat ticker item stream: [trades lane] [agent lane] [news lane].
-function buildTickerItems({ articles, grouping, trades, health, lanes, paused }) {
+// Build the flat ticker item stream: [trades lane] [news lane].
+function buildTickerItems({ articles, grouping, trades, lanes, paused }) {
   const out = []
   const laneOn = k => !lanes || lanes[k] !== false
   if (laneOn('trades') && trades) {
@@ -560,46 +542,10 @@ function buildTickerItems({ articles, grouping, trades, health, lanes, paused })
       out.push({ kind: 'trade', lane: 'trades', key: 'terr', label: 'TRADES', sym: '!', title: `HL: ${t.error}`, detail: '', url: null })
     }
   }
-  if (laneOn('agent') && health) {
-    const pinItems = (health.pins || []).slice(0, 2)
-    const warnSigs = (health.signals || []).filter(s => s.level !== 'ok').slice(0, 2)
-    pinItems.forEach(p => out.push({ kind: 'agent', lane: 'agent', key: `a${p.kind}${p.ts || p.title}`, label: 'AGENT', sym: '●', title: p.title, detail: p.ts || '', url: null }))
-    warnSigs.forEach(s => out.push({ kind: 'agent', lane: 'agent', key: `s${s.id}`, label: 'AGENT', sym: '●', title: `${s.label}: ${s.detail}`, detail: '', url: null }))
-    if (!pinItems.length && !warnSigs.length && (health.signals || []).length) {
-      out.push({ kind: 'agent', lane: 'agent', key: 'aok', label: 'AGENT', sym: '●', title: 'Agent: all systems green', detail: '', url: null })
-    }
-  }
   const newsItems = groupTickerArticles(paused ? [] : (articles || []), grouping)
     .map(a => ({ kind: 'article', lane: 'news', key: `n${a.id}`, label: a.source_name, title: a.title, age: '', published_at: a.published_at, url: a.canonical_url, id: a.id, read: a.read, watch: a.watch, favicon_url: a.favicon_url }))
   out.push(...newsItems)
   return out
-}
-
-const LEVEL_COLOR = { ok: 'var(--ui-green, #46a758)', warn: 'var(--ui-amber, #f5a623)', crit: 'var(--ui-red, #e5484d)' }
-
-function HealthRail({ signals, onOpen }) {
-  if (!Array.isArray(signals) || !signals.length) return null
-  return jsx('div', { className: `${ID}-rail`, 'aria-label': 'Agent health', children: signals.map(s =>
-    jsx('button', {
-      key: s.id, className: `${ID}-dotbtn`,
-      title: `${s.label}: ${s.detail}`,
-      'aria-label': `${s.label}: ${s.detail}`,
-      style: { background: LEVEL_COLOR[s.level] || 'var(--ui-text-quaternary)' },
-      onClick: () => onOpen(s.id)
-    })
-  ) })
-}
-
-function PinsCluster({ pins, onOpen }) {
-  const high = (pins || []).filter(p => p.severity === 'high')
-  if (!high.length) return null
-  return jsx('button', {
-    className: `${ID}-pins`,
-    title: high.map(p => p.title).join(' · '),
-    'aria-label': `${high.length} high-priority signal${high.length === 1 ? '' : 's'}`,
-    onClick: () => onOpen(),
-    children: [`⚠ ${high.length}`]
-  })
 }
 
 function NewswireTicker() {
@@ -607,7 +553,7 @@ function NewswireTicker() {
   const paused = useValue($tickerPaused)
   const enabled = settings ? settings.ticker_enabled !== false : false
   const duration = SPEED_DURATIONS[settings?.ticker_speed] || 150
-  const lanes = settings?.ticker_lanes || { news: true, trades: true, agent: true }
+  const lanes = settings?.ticker_lanes || { news: true, trades: true }
 
   const articlesQ = useQuery({
     queryKey: [ID, 'ticker', settings?.only_unread === true],
@@ -621,15 +567,14 @@ function NewswireTicker() {
     retry: false
   })
   const tradesQ = useTrades()
-  const healthQ = useAgentHealth()
   const reduced = useReducedMotion()
   useAgeTick()
   const fontSizePx = Math.min(20, Math.max(9, Number(settings?.ticker_font_size) || 11))
   const grouping = settings?.ticker_grouping || 'newest'
 
   const flatItems = useMemo(
-    () => buildTickerItems({ articles: articlesQ.data || [], grouping, trades: tradesQ.data, health: healthQ.data, lanes, paused }),
-    [settings, articlesQ.data, tradesQ.data, healthQ.data, paused, grouping, lanes]
+    () => buildTickerItems({ articles: articlesQ.data || [], grouping, trades: tradesQ.data, lanes, paused }),
+    [settings, articlesQ.data, tradesQ.data, paused, grouping, lanes]
   )
   openArticleMode = settings?.open_article_behavior === 'external' ? 'external' : 'internal'
 
@@ -656,32 +601,17 @@ function NewswireTicker() {
     }
   }, [articlesQ.data, notifyEnabled])
 
-  // Agent crit level → notify once per signal until it returns to ok.
-  useEffect(() => {
-    const sigs = healthQ.data?.signals || []
-    sigs.forEach(s => {
-      if (s.level === 'crit' && !__notifiedCrit[s.id]) {
-        __notifiedCrit[s.id] = true
-        host.notify({ kind: 'info', message: `⚠ ${s.label}: ${s.detail}` })
-      }
-      if (s.level === 'ok') __notifiedCrit[s.id] = false
-    })
-  }, [healthQ.data])
-
-  // Pins = watch-matched news + agent high-severity events (Alert pins).
+  // Pins = watch-matched news (Alert pins).
   const pins = useMemo(() => {
     const out = []
     for (const a of (articlesQ.data || [])) if (a.watch) out.push({ lane: 'news', severity: 'high', title: a.title })
-    for (const p of (healthQ.data?.pins || [])) out.push(p)
     return out.slice(0, 9)
-  }, [articlesQ.data, healthQ.data])
+  }, [articlesQ.data])
 
   const onPinOpen = () => {
-    const agentPin = pins.find(p => p.lane === 'agent')
-    $pinTab.set(agentPin ? 'agent' : 'watchlist')
+    $pinTab.set('watchlist')
     host.navigate(PAGE_PATH)
   }
-  const onHealthOpen = () => { $pinTab.set('agent'); host.navigate(PAGE_PATH) }
 
   // Reduced motion: rotate ONE static headline instead of a marquee.
   const [rotIdx, setRotIdx] = useState(0)
@@ -743,8 +673,7 @@ function NewswireTicker() {
         children: 'NEWSWIRE'
       }),
       jsx(TickerRefresh, {}),
-      settings?.pins_enabled !== false ? jsx(PinsCluster, { pins, onOpen: onPinOpen }) : null,
-      jsx(HealthRail, { signals: healthQ.data?.signals, onOpen: onHealthOpen }),
+      settings?.pins_enabled !== false && pins.length ? jsx('span', { className: `${ID}-pinscount`, title: 'Watch-matched headlines', children: `${pins.length} watch` }) : null,
       content
     ]
   })
@@ -1067,58 +996,6 @@ function TradesTab() {
     })
   ]})
 }
-
-function AgentTab() {
-  const q = useAgentHealth()
-  const h = q.data || { signals: [], pins: [], kanban: {} }
-  const refresh = () => queryClient.invalidateQueries({ queryKey: [ID, 'agent'] })
-  const sigs = h.signals || []
-  const fails = h.pins || []
-  const kb = h.kanban || {}
-  return jsxs('div', { className: `${ID}-page`, children: [
-    jsxs('div', { className: `${ID}-tabs`, children: [
-      jsx('span', { className: 'text-sm text-(--ui-text-primary)', children: 'Hermes agent health' }),
-      h.as_of ? jsx('span', { className: 'text-xs text-(--ui-text-quaternary)', children: `as of ${relTime(h.as_of)} ago` }) : null,
-      jsx('span', { style: { flex: 1 } }),
-      jsx(Button, { size: 'xs', variant: 'ghost', onClick: () => refresh(), disabled: q.isFetching, children: q.isFetching ? 'Refreshing…' : 'Refresh' })
-    ]}),
-    jsx('div', { className: `${ID}-scrollwrap`, children:
-      jsx(ScrollArea, { className: 'h-full', children:
-        q.isLoading
-          ? jsx('div', { className: 'grid h-full place-items-center p-4', children: jsx(GlyphSpinner, {}) })
-          : jsxs('div', { children: [
-              jsxs('div', { className: `${ID}-list`, children: sigs.map(s => jsxs('div', { className: `${ID}-row`, children: [
-                jsx('span', { className: `${ID}-dotbtn`, title: s.label, style: { background: LEVEL_COLOR[s.level] || 'var(--ui-text-quaternary)' } }),
-                jsx('div', { className: `${ID}-rowmain`, children: [
-                  jsx('span', { className: 'text-sm text-(--ui-text-primary)', children: s.label }),
-                  jsx('div', { className: `${ID}-meta`, children: jsx('span', { children: s.detail }) })
-                ]})
-              ] }, `sig${s.id}`)) }),
-              fails.length ? jsxs('div', { className: `${ID}-section`, children: ['Open signals', jsx('span', { className: `${ID}-sectioncount`, children: fails.length })] }) : null,
-              fails.length ? jsx('div', { className: `${ID}-list`, children: fails.map((f, i) => jsxs('div', { className: `${ID}-row`, children: [
-                jsx('div', { className: `${ID}-rowmain`, children: [
-                  jsx('span', { className: 'text-sm text-(--ui-text-primary)', children: f.title }),
-                  jsx('div', { className: `${ID}-meta`, children: jsx('span', { children: f.ts ? relTime(f.ts) : '' }) })
-                ]})
-              ] }, `pin${i}`)) }) : null,
-              kb.latest ? jsxs('div', { className: `${ID}-section`, children: ['Kanban board'] }) : null,
-              kb.latest ? jsxs('div', { className: `${ID}-card`, children: [
-                jsx('span', { className: 'text-sm text-(--ui-text-primary)', children: `Running: ${kb.latest.title}` }),
-                jsx('div', { className: `${ID}-meta`, children: [
-                  jsx('span', { children: `assignee ${kb.latest.assignee || '—'}` }),
-                  jsx('span', { children: `status ${kb.latest.status}` })
-                ]}),
-                kb.counts ? jsx('div', { className: `${ID}-meta`, children: Object.entries(kb.counts).map(([k, v]) => jsx('span', { children: `${k}:${v}` }, k)) }) : null
-              ]}) : null
-            ]})
-      })
-    })
-  ]})
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// Page — Sources
-// ─────────────────────────────────────────────────────────────────────────
 
 function AddSourceCard({ onAdded, autofocus }) {
   const [url, setUrl] = useState('')
@@ -1538,7 +1415,7 @@ function SettingsTab() {
           jsx('div', { className: 'text-xs text-(--ui-text-quaternary)', children: 'Feeds are polled by the backend with ETag/Last-Modified caching; unchanged feeds are not re-downloaded. Per-source refresh overrides: Sources → Edit.' }),
           jsx(Separator, {}),
           jsx('div', { className: `${ID}-setgroup`, children: 'Signal lanes' }),
-          jsx('div', { className: `${ID}-setrow`, children: ['news', 'trades', 'agent'].map(k =>
+          jsx('div', { className: `${ID}-setrow`, children: ['news', 'trades'].map(k =>
             jsxs('span', { key: k, style: { display: 'inline-flex', gap: '0.375rem', alignItems: 'center' }, children: [
               jsx(Switch, { size: 'xs', checked: (s.ticker_lanes || {})[k] !== false, onCheckedChange: v => save.mutate({ ticker_lanes: { ...(s.ticker_lanes || {}), [k]: v } }) }),
               jsx('span', { className: `${ID}-setlabel`, children: `${k} lane` })
@@ -1616,14 +1493,12 @@ function NewswirePage() {
       tabBtn('latest', 'Latest'),
       tabBtn('watchlist', 'Watchlist'),
       tabBtn('trades', 'Trades'),
-      tabBtn('agent', 'Agent'),
       tabBtn('sources', `Sources${sources.length ? ` (${sources.length})` : ''}`),
       tabBtn('settings', 'Settings')
     ]}),
     tab === 'latest' ? jsx(LatestTab, { sources, prefs, setPrefs }) :
     tab === 'watchlist' ? jsx(WatchlistTab, { sources, prefs, setPrefs }) :
     tab === 'trades' ? jsx(TradesTab, {}) :
-    tab === 'agent' ? jsx(AgentTab, {}) :
     tab === 'sources' ? jsx(SourcesTab, { sources, onChanged, autofocusAdd: addFocusArmed }) :
     jsx(SettingsTab, {})
   ]})

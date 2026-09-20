@@ -162,7 +162,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "open_article_behavior": "internal",   # internal (preview pane) | external (OS browser)
     "only_unread": False,
     # --- Signal lanes (2026-09-17: news · trades · agent) ---
-    "ticker_lanes": {"news": True, "trades": True, "agent": True},
+    "ticker_lanes": {"news": True, "trades": True},
     "hl_address": "0x09F60D19350BE74a0B95cCf1911b8283d976BBf7",
     "hl_poll_interval": 60,
     "watchlist": ["HYPE", "BTC", "ETH", "SOL"],
@@ -1595,7 +1595,7 @@ def _validate_setting(key: str, value: Any) -> Any:
     if key == "ticker_lanes":
         if not isinstance(value, dict) or not value:
             raise _err(400, "bad_type", "ticker_lanes must be a non-empty object")
-        allowed_lanes = {"news", "trades", "agent"}
+        allowed_lanes = {"news", "trades"}
         out = {}
         for k, v in value.items():
             if k not in allowed_lanes:
@@ -2292,196 +2292,6 @@ async def trades_lane() -> dict[str, Any]:
         return cache["snapshot"]
     with _db() as conn:
         return await _hl_fetch(conn)
-
-
-# ---------------------------------------------------------------------------
-# Agent health — cron registries, heartbeat files, kanban churn
-# ---------------------------------------------------------------------------
-
-def _profile_cron_dirs() -> list[Path]:
-    home = Path(get_hermes_home())
-    dirs = [home / "cron"]
-    for p in sorted((home / "profiles").glob("*")):
-        d = p / "cron"
-        if d.exists():
-            dirs.append(d)
-    return dirs
-
-
-def _parse_ts(iso: Any):
-    if not iso:
-        return None
-    try:
-        return datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return None
-
-
-def _load_jobs(d: Path) -> dict[str, dict[str, Any]]:
-    try:
-        data = json.loads((d / "jobs.json").read_text("utf-8"))
-    except Exception:
-        return {}
-    return {j.get("id"): j for j in (data.get("jobs") or []) if j.get("id")}
-
-
-def _cron_failures(hours: int = 24) -> dict[str, Any]:
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=hours)
-    seen: dict[str, dict[str, Any]] = {}
-    total_events = 0
-    for d in _profile_cron_dirs():
-        jobs = _load_jobs(d)
-        edb = d / "executions.db"
-        rows: list[Any] = []
-        if edb.exists():
-            try:
-                conn = sqlite3.connect(f"file:{edb}?mode=ro", uri=True, timeout=5)
-                try:
-                    rows = conn.execute(
-                        "SELECT job_id, status, claimed_at, error FROM executions WHERE status IN ('failed','unknown')"
-                    ).fetchall()
-                except sqlite3.Error:
-                    rows = []
-                conn.close()
-            except Exception:
-                rows = []
-        for r in rows:
-            ts = _parse_ts(r[2]) if len(r) > 2 else None
-            if ts is None or ts.astimezone(timezone.utc) < cutoff:
-                continue
-            total_events += 1
-            job = jobs.get(r[0]) or {}
-            f = {
-                "job_id": r[0],
-                "name": job.get("name") or r[0],
-                "status": r[1],
-                "at": r[2],
-                "error": (r[3] or "")[:200] if len(r) > 3 else "",
-            }
-            if f["job_id"] not in seen or (f.get("at") or "") > (seen[f["job_id"]].get("at") or ""):
-                seen[f["job_id"]] = f
-        # jobs.json failure_streak surfaces chronic red jobs even between runs.
-        for j in jobs.values():
-            if j.get("enabled") and (j.get("failure_streak") or 0) > 0:
-                f = {
-                    "job_id": j.get("id"),
-                    "name": j.get("name"),
-                    "status": "streak",
-                    "at": j.get("last_run_at"),
-                    "error": (j.get("last_error") or "")[:200],
-                }
-                if f["job_id"] not in seen:
-                    seen[f["job_id"]] = f
-    uniq = sorted(seen.values(), key=lambda f: f.get("at") or "", reverse=True)
-    return {"failed_24h": len(uniq), "total_events": total_events, "jobs": uniq[:6]}
-
-
-def _heartbeat_age() -> dict[str, Any]:
-    p = _shared_home() / "state" / "gateway.heartbeat"
-    try:
-        data = json.loads(p.read_text("utf-8"))
-        dt = _parse_ts(data.get("updated_at"))
-        if dt is None:
-            return {"age_s": None, "ok": False}
-        age = max(0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds())
-        return {"age_s": int(age), "ok": age < 900}
-    except Exception:
-        return {"age_s": None, "ok": False}
-
-
-def _ticker_age() -> dict[str, Any]:
-    now = datetime.now(timezone.utc).timestamp()
-    fresh = None
-    for d in _profile_cron_dirs():
-        try:
-            age = now - float((d / "ticker_heartbeat").read_text().strip())
-        except Exception:
-            continue
-        fresh = age if fresh is None else min(fresh, age)
-    if fresh is None:
-        return {"age_s": None, "ok": False}
-    return {"age_s": int(fresh), "ok": fresh < 300}
-
-
-def _kanban_churn() -> dict[str, Any]:
-    p = _shared_home() / "kanban.db"
-    if not p.exists():
-        return {"counts": {}, "latest": None}
-    try:
-        conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5)
-        counts: dict[str, int] = {}
-        for row in conn.execute("SELECT status, COUNT(*) FROM tasks GROUP BY status"):
-            counts[row[0]] = row[1]
-        latest = None
-        row = conn.execute(
-            "SELECT title, assignee, status, started_at FROM tasks ORDER BY COALESCE(started_at,0) DESC LIMIT 1"
-        ).fetchone()
-        if row:
-            latest = {"title": row[0], "assignee": row[1], "status": row[2], "started_at": row[3]}
-        conn.close()
-        return {"counts": counts, "latest": latest}
-    except Exception:
-        return {"counts": {}, "latest": None}
-
-
-@router.get("/agent/health")
-def agent_health() -> dict[str, Any]:
-    crons = _cron_failures(24)
-    hb = _heartbeat_age()
-    tk = _ticker_age()
-    kb = _kanban_churn()
-
-    def sev(ok: bool, warn_age: int = 3600, age: int | None = None) -> str:
-        if ok:
-            return "ok"
-        if age is not None and age < warn_age:
-            return "warn"
-        return "crit"
-
-    signals = [
-        {
-            "id": "cron", "label": "Cron",
-            "level": "crit" if crons["failed_24h"] else "ok",
-            "detail": f"{crons['failed_24h']} failing / open" if crons["failed_24h"] else "all green",
-            "count": crons["failed_24h"],
-        },
-        {
-            "id": "gateway", "label": "Gateway",
-            "level": "ok" if hb.get("ok") else sev(False, 3600, hb.get("age_s")),
-            "detail": (f"{hb['age_s']}s" if hb.get("age_s") is not None else "n/a"),
-            "count": 0,
-        },
-        {
-            "id": "ticker", "label": "Ticker",
-            "level": "ok" if tk.get("ok") else sev(False, 1800, tk.get("age_s")),
-            "detail": (f"{tk['age_s']}s" if tk.get("age_s") is not None else "n/a"),
-            "count": 0,
-        },
-        {
-            "id": "kanban", "label": "Board",
-            "level": "ok",
-            "detail": ", ".join(
-                f"{k}:{v}" for k, v in (kb.get("counts") or {}).items()
-                if k in ("running", "blocked", "review", "todo", "ready")
-            ) or "empty",
-            "count": 0,
-        },
-    ]
-    pins = [
-        {
-            "lane": "agent", "severity": "high", "kind": "cron_fail",
-            "ts": f.get("at"), "title": f"cron failed: {f['name']}",
-        }
-        for f in crons["jobs"]
-    ]
-    return {
-        "ok": True,
-        "as_of": _now_iso(),
-        "signals": signals,
-        "pins": pins[:5],
-        "kanban": kb,
-    }
 
 
 # ===========================================================================
